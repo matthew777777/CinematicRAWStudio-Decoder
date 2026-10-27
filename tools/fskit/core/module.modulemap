@@ -1,0 +1,5 @@
+module CrawFSCore {
+    header "CrawFSCore.h"
+    link "c++"
+    export *
+}
