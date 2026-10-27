@@ -26,7 +26,7 @@ int main(int argc, char** argv) {
             for (auto& c : r.chunks())
                 std::printf("  %.4s @%llu size=%llu ts=%lld%s\n", c.fourcc.data(),
                             (unsigned long long)c.offset, (unsigned long long)c.size,
-                            (long long)c.timestampNs, c.crcOk ? "" : " CRC-BAD");
+                            (long long)c.timestampNs, r.crcOk(c) ? "" : " CRC-BAD");
             return 0;
         }
         std::vector<uint16_t> out;
