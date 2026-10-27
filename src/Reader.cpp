@@ -7,6 +7,14 @@
 #include <fstream>
 #include <iterator>
 
+#if defined(__unix__) || defined(__APPLE__)
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#define CRAW_HAVE_MMAP 1
+#endif
+
 namespace craw {
 namespace {
 
@@ -18,11 +26,47 @@ constexpr size_t kChunkHeader = 16, kChunkTail = 4, kFramHeader = 20;
 }  // namespace
 
 Reader::Reader(const std::string& path) {
-    std::ifstream f(path, std::ios::binary);
-    if (!f) throw DecodeError("craw: cannot open " + path);
-    data_.assign(std::istreambuf_iterator<char>(f), {});
-    const uint8_t* d = data_.data();
-    const size_t n = data_.size();
+#ifdef CRAW_HAVE_MMAP
+    const int fd = ::open(path.c_str(), O_RDONLY);
+    if (fd < 0) throw DecodeError("craw: cannot open " + path);
+    struct stat st{};
+    if (::fstat(fd, &st) == 0 && st.st_size > 0) {
+        void* m = ::mmap(nullptr, static_cast<size_t>(st.st_size), PROT_READ, MAP_PRIVATE, fd, 0);
+        if (m != MAP_FAILED) {
+            data_ = static_cast<const uint8_t*>(m);
+            size_ = static_cast<size_t>(st.st_size);
+        }
+    }
+    ::close(fd);
+#endif
+    if (!data_) {
+        std::ifstream f(path, std::ios::binary);
+        if (!f) throw DecodeError("craw: cannot open " + path);
+        owned_.assign(std::istreambuf_iterator<char>(f), {});
+        data_ = owned_.data();
+        size_ = owned_.size();
+    }
+    try {
+        scan();
+    } catch (...) {
+        release();
+        throw;
+    }
+}
+
+Reader::~Reader() { release(); }
+
+void Reader::release() {
+#ifdef CRAW_HAVE_MMAP
+    if (data_ && owned_.empty()) ::munmap(const_cast<uint8_t*>(data_), size_);
+#endif
+    data_ = nullptr;
+    size_ = 0;
+}
+
+void Reader::scan() {
+    const uint8_t* d = data_;
+    const size_t n = size_;
     if (n < 16 || std::memcmp(d, "CRAW", 4) != 0) throw DecodeError("craw: not a CRAW file");
     if ((d[4] | d[5] << 8) != 0 || (d[6] | d[7] << 8) < 2) throw DecodeError("craw: unsupported major version");
 
@@ -55,14 +99,14 @@ Reader::Reader(const std::string& path) {
 }
 
 std::string_view Reader::payload(const ChunkRef& c) const {
-    return {reinterpret_cast<const char*>(data_.data() + c.offset + kChunkHeader), c.size};
+    return {reinterpret_cast<const char*>(data_ + c.offset + kChunkHeader), c.size};
 }
 
 FrameRecord Reader::frame(size_t i) const {
     const ChunkRef& c = chunks_.at(frames_.at(i));
     if (!c.crcOk) throw DecodeError("craw: FRAM chunk CRC mismatch");
     if (c.size < kFramHeader) throw DecodeError("craw: FRAM too small");
-    const uint8_t* b = data_.data() + c.offset + kChunkHeader;
+    const uint8_t* b = data_ + c.offset + kChunkHeader;
     const uint32_t metaLen = rd32(b + 16);
     if (metaLen > c.size - kFramHeader) throw DecodeError("craw: bad FRAM meta length");
     return {rd64(b), static_cast<int64_t>(rd64(b + 8)),

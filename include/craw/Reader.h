@@ -31,7 +31,10 @@ struct FrameRecord {
 
 class Reader {
 public:
-    explicit Reader(const std::string& path);  // throws DecodeError
+    explicit Reader(const std::string& path);  // throws DecodeError; memory-maps the file
+    ~Reader();
+    Reader(const Reader&) = delete;
+    Reader& operator=(const Reader&) = delete;
 
     const std::string& metaJson() const { return meta_; }
     const std::vector<ChunkRef>& chunks() const { return chunks_; }
@@ -43,7 +46,12 @@ public:
     FrameRecord frame(size_t i) const;
 
 private:
-    std::vector<uint8_t> data_;
+    void scan();
+    void release();
+
+    const uint8_t* data_ = nullptr;
+    size_t size_ = 0;
+    std::vector<uint8_t> owned_;  // fallback when mmap is unavailable
     std::string meta_;
     std::vector<ChunkRef> chunks_;
     std::vector<size_t> frames_;  // indices into chunks_
