@@ -179,7 +179,10 @@ void Clip::init() {
     // Chunks: lens shading maps, audio, first-frame geometry.
     uint64_t wavData = 0;
     for (const auto& c : reader_.chunks()) {
-        if (!reader_.crcOk(c)) continue;
+        // Only the small LSHD/AUDI chunks are read (and CRC-checked) here;
+        // FRAM chunks are checked by Reader::frame() when decoded.
+        const bool lshd = std::memcmp(c.fourcc.data(), "LSHD", 4) == 0, audi = std::memcmp(c.fourcc.data(), "AUDI", 4) == 0;
+        if ((!lshd && !audi) || !reader_.crcOk(c)) continue;
         const auto p = reader_.payload(c);
         const auto* b = reinterpret_cast<const uint8_t*>(p.data());
         if (std::memcmp(c.fourcc.data(), "LSHD", 4) == 0 && p.size() >= 16) {

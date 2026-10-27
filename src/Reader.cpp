@@ -3,6 +3,7 @@
 
 #include "Crc32c.h"
 
+#include <cerrno>
 #include <cstring>
 #include <fstream>
 #include <iterator>

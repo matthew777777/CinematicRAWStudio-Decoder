@@ -44,6 +44,8 @@ public:
     const std::string& metaJson() const { return meta_; }
     const std::vector<ChunkRef>& chunks() const { return chunks_; }
     bool recovered() const { return recovered_; }
+    // True when the file is memory-mapped (false: read into memory).
+    bool mapped() const { return owned_.empty(); }
     size_t frameCount() const { return frames_.size(); }
 
     // Chunk payload bytes (not CRC-checked; see crcOk).
@@ -66,6 +68,7 @@ private:
     std::vector<ChunkRef> chunks_;
     std::vector<size_t> frames_;  // indices into chunks_
     bool recovered_ = false;
+
 };
 
 }  // namespace craw
