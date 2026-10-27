@@ -37,6 +37,21 @@ struct AudioInfo {
     uint64_t frames = 0;  // per channel
 };
 
+// Everything needed to develop one frame (see CinematicRAWStudio-TUI).
+struct RawFrame {
+    std::vector<uint16_t> pixels;  // width * height CFA samples
+    uint32_t width = 0, height = 0;
+    int cfa = 0;
+    std::array<double, 4> black{};  // 2x2 row-major
+    double white = 65535;
+    std::array<double, 3> neutral{1, 1, 1};  // AsShotNeutral (camera RGB of white)
+    double iso = 0, exposureSeconds = 0;
+    int64_t timestampNs = 0;
+    // Lens shading: gains per point, colour order R, Gr, Gb, B; empty = none.
+    uint16_t shadingColumns = 0, shadingRows = 0;
+    std::vector<float> shadingGains;
+};
+
 class Clip {
 public:
     explicit Clip(const std::string& path);
@@ -49,6 +64,9 @@ public:
     // `padTo` (so every frame of a clip has the same size; craw_mount needs
     // sizes before decoding). Throws DecodeError.
     std::vector<uint8_t> frameDng(size_t i, uint32_t padTo = 0, unsigned threads = 1) const;
+
+    // Decoded CFA samples plus per-frame levels, white balance and lens shading.
+    RawFrame frameRaw(size_t i, unsigned threads = 1) const;
 
     // Size of every padded DNG of this clip (all frames share dimensions).
     uint64_t paddedDngSize(uint32_t padTo) const;

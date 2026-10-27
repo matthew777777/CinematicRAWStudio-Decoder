@@ -252,6 +252,46 @@ size_t Clip::readWav(uint64_t offset, uint8_t* dst, size_t len) const {
     return done;
 }
 
+RawFrame Clip::frameRaw(size_t i, unsigned threads) const {
+    const FrameRecord rec = reader_.frame(i);
+    RawFrame out;
+    const FrameInfo fi = decodeFrame(rec.payload, rec.payloadSize, out.pixels, threads);
+    out.width = fi.width;
+    out.height = fi.height;
+    out.cfa = static_cast<int>(fi.cfa);
+    out.timestampNs = rec.timestampNs;
+    const json::Value fm = json::parseOrEmpty(rec.metaJson);
+    out.black = info_.black;
+    if (auto dyn = numbers(fm["dynamicBlackLevel"]); dyn.size() == 4) std::copy(dyn.begin(), dyn.end(), out.black.begin());
+    out.white = fm["dynamicWhiteLevel"].num(info_.white);
+    if (auto n = numbers(fm["asShotNeutral"]); n.size() == 3 && n[0] > 0 && n[1] > 0 && n[2] > 0)
+        out.neutral = {n[0], n[1], n[2]};
+    out.iso = fm["iso"].num(0);
+    const double et = fm["exposureTime"].num(0);
+    out.exposureSeconds = et > 1000 ? et / 1e9 : et;
+    if (fm["lshd_ref"].isNumber()) {
+        const auto it = shading_.find(static_cast<uint32_t>(fm["lshd_ref"].num()));
+        if (it != shading_.end()) {
+            out.shadingColumns = it->second.columns;
+            out.shadingRows = it->second.rows;
+            out.shadingGains = it->second.gains;
+        }
+    } else if (fm["lensShadingMap"].isArray() && fm["lensShadingMap"].size() == 4) {
+        const auto cols = static_cast<uint16_t>(fm["lensShadingMapWidth"].num());
+        const auto rows = static_cast<uint16_t>(fm["lensShadingMapHeight"].num());
+        const size_t pts = size_t{cols} * rows;
+        std::vector<float> g(pts * 4, 1.f);
+        bool ok = pts > 0;
+        for (int ch = 0; ch < 4 && ok; ++ch) {
+            const auto& plane = fm["lensShadingMap"][ch];
+            ok = plane.size() == pts;
+            for (size_t k = 0; ok && k < pts; ++k) g[k * 4 + ch] = static_cast<float>(plane[k].num(1));
+        }
+        if (ok) { out.shadingColumns = cols; out.shadingRows = rows; out.shadingGains = std::move(g); }
+    }
+    return out;
+}
+
 uint64_t Clip::paddedDngSize(uint32_t padTo) const { return uint64_t{padTo} + uint64_t{width_} * height_ * 2; }
 
 std::vector<uint8_t> Clip::frameDng(size_t i, uint32_t padTo, unsigned threads) const {
