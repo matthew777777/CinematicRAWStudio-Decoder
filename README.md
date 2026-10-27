@@ -13,6 +13,29 @@ scripts/build_android.sh              # Release arm64-v8a (NDK)
 ```
 License: Apache-2.0.
 
+## Easy install: Mac, Linux and Windows
+
+Install the complete toolset once with the
+[shared installer](https://github.com/matthew777777/CinematicRAWStudio-Spec/blob/main/GETTING_STARTED.md).
+It fetches the sibling repos and dependencies automatically.
+
+Mac/Linux:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/matthew777777/CinematicRAWStudio-Spec/main/scripts/install.sh | bash
+```
+
+Windows PowerShell:
+
+```powershell
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/matthew777777/CinematicRAWStudio-Spec/main/scripts/install.ps1)))
+```
+
+Open a new terminal, then use `craw` for the editor,
+`craw mount "take.craw"` for Resolve, `craw unmount` to close mounts,
+or `craw export "take.craw"` to save CinemaDNG and sound.
+
+
 ## DaVinci Resolve workflow
 
 End users: see **GETTING_STARTED.md** in CinematicRAWStudio-Spec — the

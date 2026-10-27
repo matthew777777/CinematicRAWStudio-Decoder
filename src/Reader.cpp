@@ -48,7 +48,7 @@ Reader::Reader(const std::string& path) {
 #ifdef CRAW_HAVE_WIN32_MAP
     {
         const int wlen = MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, nullptr, 0);
-        std::wstring wpath(wlen > 0 ? wlen - 1 : 0, L'\0');
+        std::wstring wpath(wlen > 0 ? wlen : 0, L'\0');
         if (wlen > 0) MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, wpath.data(), wlen);
         HANDLE file = CreateFileW(wpath.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
                                   FILE_ATTRIBUTE_NORMAL, nullptr);

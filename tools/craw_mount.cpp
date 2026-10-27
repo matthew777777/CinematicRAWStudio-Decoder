@@ -166,7 +166,11 @@ void prefetchAfter(const MountedClip& c, size_t i) {
     }
 }
 
-int doGetattr(const char* path, craw_stat_t* st) {
+int doGetattr(const char* path, craw_stat_t* st
+#if FUSE_USE_VERSION >= 30
+              , struct fuse_file_info*
+#endif
+) {
     std::memset(st, 0, sizeof *st);
     const Node n = resolve(path);
     switch (n.kind) {
@@ -193,7 +197,18 @@ int doGetattr(const char* path, craw_stat_t* st) {
     }
 }
 
-int doReaddir(const char* path, void* buf, fuse_fill_dir_t fill, craw_off_t, struct fuse_file_info*) {
+int doReaddir(const char* path, void* buf, fuse_fill_dir_t filler, craw_off_t, struct fuse_file_info*
+#if FUSE_USE_VERSION >= 30
+              , enum fuse_readdir_flags
+#endif
+) {
+    auto fill = [&](void* buffer, const char* name, const craw_stat_t* st, craw_off_t offset) {
+#if FUSE_USE_VERSION >= 30
+        return filler(buffer, name, st, offset, static_cast<fuse_fill_dir_flags>(0));
+#else
+        return filler(buffer, name, st, offset);
+#endif
+    };
     const Node n = resolve(path);
     if (n.kind != Node::Root && n.kind != Node::Dir) return -ENOENT;
     fill(buf, ".", nullptr, 0);
@@ -282,7 +297,9 @@ int main(int argc, char** argv) {
     std::string volname = "-ovolname=" + (gFlat ? gClips.front().name : std::string("CRAW"));
     fuseArgs.push_back(const_cast<char*>("-o"));
     fuseArgs.push_back(const_cast<char*>("ro"));
+#if defined(__APPLE__) || defined(_WIN32)
     fuseArgs.push_back(volname.data());
+#endif
     fuse_operations ops{};
     ops.getattr = doGetattr;
     ops.readdir = doReaddir;
