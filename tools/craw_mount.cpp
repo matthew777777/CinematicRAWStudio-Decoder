@@ -44,6 +44,11 @@ using craw_off_t = off_t;
 #include <mutex>
 #include <string>
 #include <thread>
+#if defined(__APPLE__)
+#include <sys/sysctl.h>
+#endif
+#include <deque>
+#include <atomic>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -56,6 +61,9 @@ struct MountedClip {
     std::unique_ptr<craw::tools::Clip> clip;
     uint32_t pad = 0;
     uint64_t dngSize = 0;
+    // Last frame read, for playback prefetch (heap-held: atomics don't move).
+    struct Playback { std::atomic<long> lastFrame{-2}; };
+    std::unique_ptr<Playback> play = std::make_unique<Playback>();
 };
 
 struct CachedFrame {
@@ -68,11 +76,32 @@ std::vector<MountedClip> gClips;
 bool gFlat = false;
 std::mutex gCacheMutex;
 std::list<CachedFrame> gCache;  // most recent first
-constexpr size_t kCacheFrames = 12;
-constexpr size_t kPrefetch = 4;  // frames decoded ahead of sequential playback
+// Cache by memory, not frame count: scrubbing revisits frames, and a
+// back-and-forth scrub should hit decoded DNGs. --cache-mb overrides.
+uint64_t gCacheBytes = 2048ull << 20;
+uint64_t gCachedBytes = 0;
+constexpr size_t kPrefetch = 6;  // frames decoded ahead of sequential playback
 std::condition_variable gCacheReady;
 std::vector<std::pair<const MountedClip*, size_t>> gInFlight;
-const unsigned kThreads = std::max(1u, std::thread::hardware_concurrency());
+// Decode on the performance cores only: on Apple silicon, spreading one
+// frame over the efficiency cores too is slower (threads wait for the
+// slowest band).
+unsigned performanceCores() {
+#if defined(__APPLE__)
+    int n = 0;
+    size_t len = sizeof n;
+    if (sysctlbyname("hw.perflevel0.physicalcpu", &n, &len, nullptr, 0) == 0 && n > 0) return static_cast<unsigned>(n);
+#endif
+    return std::max(1u, std::thread::hardware_concurrency());
+}
+const unsigned kThreads = performanceCores();
+// Prefetch: a small fixed pool takes jobs from a queue that each new
+// playback position replaces, so stale frames are never decoded and an
+// on-demand decode (Resolve waiting) keeps most of the cores.
+constexpr unsigned kPrefetchWorkers = 2;
+std::mutex gQueueMutex;
+std::condition_variable gQueueReady;
+std::deque<std::pair<const MountedClip*, size_t>> gQueue;
 
 struct Node {
     const MountedClip* clip = nullptr;
@@ -114,7 +143,7 @@ Node resolve(const char* path) {
 
 // Cached DNG for frame i; decodes on miss (waiting for an in-flight prefetch
 // of the same frame instead of decoding twice).
-std::shared_ptr<const std::vector<uint8_t>> frameBytes(const MountedClip& c, size_t i) {
+std::shared_ptr<const std::vector<uint8_t>> frameBytes(const MountedClip& c, size_t i, unsigned threads = kThreads) {
     {
         std::unique_lock lock(gCacheMutex);
         for (;;) {
@@ -133,7 +162,7 @@ std::shared_ptr<const std::vector<uint8_t>> frameBytes(const MountedClip& c, siz
     }
     std::shared_ptr<const std::vector<uint8_t>> bytes;
     try {
-        bytes = std::make_shared<const std::vector<uint8_t>>(c.clip->frameDng(i, c.pad, kThreads));
+        bytes = std::make_shared<const std::vector<uint8_t>>(c.clip->frameDng(i, c.pad, threads));
     } catch (...) {
         std::lock_guard lock(gCacheMutex);
         gInFlight.erase(std::find(gInFlight.begin(), gInFlight.end(), std::make_pair(&c, i)));
@@ -143,27 +172,61 @@ std::shared_ptr<const std::vector<uint8_t>> frameBytes(const MountedClip& c, siz
     std::lock_guard lock(gCacheMutex);
     gInFlight.erase(std::find(gInFlight.begin(), gInFlight.end(), std::make_pair(&c, i)));
     gCache.push_front({&c, i, bytes});
-    if (gCache.size() > kCacheFrames) gCache.pop_back();
+    gCachedBytes += bytes->size();
+    while (gCache.size() > 1 && gCachedBytes > gCacheBytes) {
+        gCachedBytes -= gCache.back().bytes->size();
+        gCache.pop_back();
+    }
     gCacheReady.notify_all();
     return bytes;
 }
 
-// Readers such as Resolve walk a sequence in order: decode the next frames
-// in the background while the current one is being read.
-void prefetchAfter(const MountedClip& c, size_t i) {
-    for (size_t k = 1; k <= kPrefetch && i + k < c.clip->frameCount(); ++k) {
-        const size_t f = i + k;
+bool cachedOrInFlight(const MountedClip& c, size_t f) {
+    std::lock_guard lock(gCacheMutex);
+    const auto key = std::make_pair(&c, f);
+    return std::find(gInFlight.begin(), gInFlight.end(), key) != gInFlight.end() ||
+           std::any_of(gCache.begin(), gCache.end(), [&](const CachedFrame& e) { return e.clip == &c && e.index == f; });
+}
+
+void prefetchWorker() {
+    // Prefetch decodes share the cores: on-demand reads must not wait behind them.
+    const unsigned threads = std::max(1u, kThreads / kPrefetchWorkers);
+    for (;;) {
+        std::pair<const MountedClip*, size_t> job;
         {
-            std::lock_guard lock(gCacheMutex);
-            const auto key = std::make_pair(&c, f);
-            if (std::find(gInFlight.begin(), gInFlight.end(), key) != gInFlight.end()) continue;
-            if (std::any_of(gCache.begin(), gCache.end(), [&](const CachedFrame& e) { return e.clip == &c && e.index == f; }))
-                continue;
+            std::unique_lock lock(gQueueMutex);
+            gQueueReady.wait(lock, [] { return !gQueue.empty(); });
+            job = gQueue.front();
+            gQueue.pop_front();
         }
-        std::thread([&c, f] {
-            try { frameBytes(c, f); } catch (...) {}
-        }).detach();
+        if (cachedOrInFlight(*job.first, job.second)) continue;
+        try { frameBytes(*job.first, job.second, threads); } catch (...) {}
     }
+}
+
+// Readers such as Resolve walk a sequence in order (forwards when playing,
+// backwards in reverse shuttle): decode the next frames in that direction.
+// A jump (scrub) prefetches nothing, so the requested frame gets the CPU.
+void notePlayback(const MountedClip& c, size_t i) {
+    const long cur = static_cast<long>(i), last = c.play->lastFrame.exchange(cur);
+    if (cur == last) return;  // further reads of the same frame
+    const long step = cur - last;
+    if (step != 1 && step != -1) {
+        std::lock_guard lock(gQueueMutex);
+        gQueue.clear();  // scrubbing: drop the stale plan
+        return;
+    }
+    std::vector<std::pair<const MountedClip*, size_t>> plan;
+    for (long k = 1; k <= static_cast<long>(kPrefetch); ++k) {
+        const long f = cur + k * step;
+        if (f < 0 || f >= static_cast<long>(c.clip->frameCount())) break;
+        plan.emplace_back(&c, static_cast<size_t>(f));
+    }
+    {
+        std::lock_guard lock(gQueueMutex);
+        gQueue.assign(plan.begin(), plan.end());
+    }
+    gQueueReady.notify_all();
 }
 
 int doGetattr(const char* path, craw_stat_t* st
@@ -244,8 +307,8 @@ int doRead(const char* path, char* out, size_t size, craw_off_t offset, struct f
     }
     if (n.kind != Node::Dng) return -ENOENT;
     try {
+        notePlayback(*n.clip, n.frame);
         const auto bytes = frameBytes(*n.clip, n.frame);
-        if (offset == 0) prefetchAfter(*n.clip, n.frame);
         if (static_cast<uint64_t>(offset) >= bytes->size()) return 0;
         const size_t len = std::min(size, bytes->size() - static_cast<size_t>(offset));
         std::memcpy(out, bytes->data() + offset, len);
@@ -260,18 +323,20 @@ int doRead(const char* path, char* out, size_t size, craw_off_t offset, struct f
 
 int main(int argc, char** argv) {
     if (argc < 3) {
-        std::fprintf(stderr, "usage: craw_mount MOUNTPOINT clip.craw [clip.craw ...] [-f] [fuse options]\n");
+        std::fprintf(stderr, "usage: craw_mount MOUNTPOINT clip.craw [clip.craw ...] [--cache-mb 2048] [-f] [fuse options]\n");
         return 2;
     }
     std::vector<char*> fuseArgs{argv[0], argv[1]};
     for (int i = 2; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--flat") { gFlat = true; continue; }
+        if (a == "--cache-mb" && i + 1 < argc) { gCacheBytes = std::stoull(argv[++i]) << 20; continue; }
         if (!a.empty() && a[0] == '-') { fuseArgs.push_back(argv[i]); continue; }
         try {
             MountedClip c;
             c.name = fs::path(a).stem().string();
             c.clip = std::make_unique<craw::tools::Clip>(a);
+            c.clip->setPackedDng(true);  // fewer bytes through FUSE
             struct stat src{};
             if (::stat(a.c_str(), &src) == 0) c.mtime = src.st_mtime;
             if (c.clip->frameCount() == 0) { std::fprintf(stderr, "skip %s: no frames\n", a.c_str()); continue; }
@@ -279,7 +344,7 @@ int main(int argc, char** argv) {
             // varies per frame (e.g. a larger lens-shading GainMap).
             const auto [w, h] = c.clip->imageSize();
             const auto probe = c.clip->frameDng(0, 0, kThreads);
-            const uint64_t header = probe.size() - uint64_t{w} * h * (c.clip->isRgb() ? 6 : 2);
+            const uint64_t header = probe.size() - c.clip->dngPixelBytes();
             c.pad = static_cast<uint32_t>((header + (1u << 20) + 4095) / 4096 * 4096);
             c.dngSize = c.clip->paddedDngSize(c.pad);
             std::printf("%s: %zu frames %ux%u -> %s/%s/\n", a.c_str(), c.clip->frameCount(), w, h, argv[1],
@@ -300,6 +365,7 @@ int main(int argc, char** argv) {
 #if defined(__APPLE__) || defined(_WIN32)
     fuseArgs.push_back(volname.data());
 #endif
+    for (unsigned k = 0; k < kPrefetchWorkers; ++k) std::thread(prefetchWorker).detach();
     fuse_operations ops{};
     ops.getattr = doGetattr;
     ops.readdir = doReaddir;

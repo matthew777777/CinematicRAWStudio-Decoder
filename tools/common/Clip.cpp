@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "Clip.h"
 
+#include <thread>
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -331,10 +332,19 @@ RawFrame Clip::frameRaw(size_t i, unsigned threads) const {
     return out;
 }
 
-uint64_t Clip::paddedDngSize(uint32_t padTo) const {
-    // RGB frames: (W/2 x H/2) pixels x 3 samples x 2 bytes.
-    return uint64_t{padTo} + (rgb_ ? uint64_t{width_ / 2} * (height_ / 2) * 6 : uint64_t{width_} * height_ * 2);
+void Clip::setPackedDng(bool on) {
+    unsigned bits = 1;
+    while (bits < 16 && (1u << bits) <= info_.white) ++bits;
+    packBits_ = on ? bits : 16;
 }
+
+uint64_t Clip::dngPixelBytes() const {
+    // RGB frames: (W/2 x H/2) pixels x 3 samples. Packed rows end on a byte boundary.
+    const uint64_t w = rgb_ ? width_ / 2 : width_, h = rgb_ ? height_ / 2 : height_, spp = rgb_ ? 3 : 1;
+    return (w * spp * packBits_ + 7) / 8 * h;
+}
+
+uint64_t Clip::paddedDngSize(uint32_t padTo) const { return uint64_t{padTo} + dngPixelBytes(); }
 
 std::vector<uint8_t> Clip::frameDng(size_t i, uint32_t padTo, unsigned threads) const {
     const FrameRecord rec = reader_.frame(i);
@@ -362,8 +372,9 @@ std::vector<uint8_t> Clip::frameDng(size_t i, uint32_t padTo, unsigned threads) 
     ifd.longs(254, {0});
     ifd.longs(256, {outW});
     ifd.longs(257, {outH});
-    if (rgb) ifd.shorts(258, {16, 16, 16});
-    else ifd.shorts(258, {16});
+    const auto bits = static_cast<uint16_t>(packBits_);
+    if (rgb) ifd.shorts(258, {bits, bits, bits});
+    else ifd.shorts(258, {bits});
     ifd.shorts(259, {1});
     ifd.shorts(262, {static_cast<uint16_t>(rgb ? 34892 : 32803)});
     ifd.ascii(271, info_.make);
@@ -373,7 +384,7 @@ std::vector<uint8_t> Clip::frameDng(size_t i, uint32_t padTo, unsigned threads) 
     ifd.shorts(274, {static_cast<uint16_t>(deg == 90 ? 6 : deg == 180 ? 3 : deg == 270 ? 8 : 1)});
     ifd.shorts(277, {static_cast<uint16_t>(spp)});
     ifd.longs(278, {outH});
-    ifd.longs(279, {outW * outH * 2 * spp});
+    ifd.longs(279, {static_cast<uint32_t>(dngPixelBytes())});
     ifd.shorts(284, {1});
     ifd.ascii(305, "Cinematic RAW Studio craw2dng");
     static const uint8_t pattern[4][4] = {{0, 1, 1, 2}, {1, 0, 2, 1}, {1, 2, 0, 1}, {2, 1, 1, 0}};
@@ -509,9 +520,48 @@ std::vector<uint8_t> Clip::frameDng(size_t i, uint32_t padTo, unsigned threads) 
     if (padTo > 0 && 8 + ifdBytes.size() > padTo) throw DecodeError("craw2dng: DNG header exceeds padding");
     out.insert(out.end(), ifdBytes.begin(), ifdBytes.end());
     out.resize(stripOffset, 0);
-    const size_t px = pixels.size() * 2;
-    out.resize(stripOffset + px);
-    std::memcpy(out.data() + stripOffset, pixels.data(), px);  // little-endian host
+    if (packBits_ == 16) {
+        const size_t px = pixels.size() * 2;
+        out.resize(stripOffset + px);
+        std::memcpy(out.data() + stripOffset, pixels.data(), px);  // little-endian host
+        return out;
+    }
+    // Bit-packed, MSB first, each row starting on a byte. A sample above the
+    // white level (cannot occur at the sensor bit depth) is clamped to it.
+    const size_t rowSamples = size_t{outW} * spp, rowBytes = (rowSamples * packBits_ + 7) / 8;
+    out.resize(stripOffset + rowBytes * outH, 0);
+    const uint32_t maxV = (1u << packBits_) - 1;
+    auto packRows = [&](uint32_t y0, uint32_t y1) {
+        for (uint32_t y = y0; y < y1; ++y) {
+            const uint16_t* s = pixels.data() + size_t{y} * rowSamples;
+            uint8_t* d = out.data() + stripOffset + size_t{y} * rowBytes;
+            size_t k = 0;
+            if (bits == 10)  // common case: 4 samples -> 5 bytes
+                for (; k + 4 <= rowSamples; k += 4, d += 5) {
+                    const uint32_t a = std::min<uint32_t>(s[k], maxV), b = std::min<uint32_t>(s[k + 1], maxV);
+                    const uint32_t c = std::min<uint32_t>(s[k + 2], maxV), e = std::min<uint32_t>(s[k + 3], maxV);
+                    d[0] = static_cast<uint8_t>(a >> 2);
+                    d[1] = static_cast<uint8_t>((a << 6) | (b >> 4));
+                    d[2] = static_cast<uint8_t>((b << 4) | (c >> 6));
+                    d[3] = static_cast<uint8_t>((c << 2) | (e >> 8));
+                    d[4] = static_cast<uint8_t>(e);
+                }
+            uint64_t acc = 0;
+            unsigned n = 0;
+            for (; k < rowSamples; ++k) {
+                acc = (acc << bits) | std::min<uint32_t>(s[k], maxV);
+                n += bits;
+                while (n >= 8) { n -= 8; *d++ = static_cast<uint8_t>(acc >> n); }
+            }
+            if (n) *d = static_cast<uint8_t>(acc << (8 - n));
+        }
+    };
+    const unsigned parts = std::max(1u, std::min(threads, outH));
+    std::vector<std::thread> pool;
+    for (unsigned t = 1; t < parts; ++t)
+        pool.emplace_back(packRows, outH * t / parts, outH * (t + 1) / parts);
+    packRows(0, outH / parts);
+    for (auto& th : pool) th.join();
     return out;
 }
 

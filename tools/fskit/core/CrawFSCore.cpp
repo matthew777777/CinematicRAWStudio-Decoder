@@ -102,10 +102,11 @@ CrawFsClip* crawfs_open(const char* path, char* err, size_t errLen) {
     try {
         auto c = std::make_unique<CrawFsClip>();
         c->clip = std::make_unique<craw::tools::Clip>(path);
+        c->clip->setPackedDng(true);  // fewer bytes through the filesystem
         if (c->clip->frameCount() == 0) throw std::runtime_error("take has no frames");
         const auto [w, h] = c->clip->imageSize();
         const auto probe = c->clip->frameDng(0, 0, c->threads);
-        const uint64_t header = probe.size() - uint64_t{w} * h * (c->clip->isRgb() ? 6 : 2);
+        const uint64_t header = probe.size() - c->clip->dngPixelBytes();
         // Fixed header room: first frame's header + 1 MiB for metadata that varies per frame.
         c->pad = static_cast<uint32_t>((header + (1u << 20) + 4095) / 4096 * 4096);
         c->dngSize = c->clip->paddedDngSize(c->pad);

@@ -76,6 +76,12 @@ public:
     uint64_t paddedDngSize(uint32_t padTo) const;
     std::pair<uint32_t, uint32_t> frameSize() const { return {width_, height_}; }  // coded frame size
     bool isRgb() const { return rgb_; }
+    // DNG samples bit-packed (MSB first) at the sensor bit depth instead of
+    // 16 bits each: 10-bit takes become 37.5 % smaller, still lossless.
+    // Used by the mounts, where every byte crosses the filesystem bridge.
+    void setPackedDng(bool on);
+    // Bytes of one frame's DNG pixel strip.
+    uint64_t dngPixelBytes() const;
     // Picture size: half the coded size for RGB frames.
     std::pair<uint32_t, uint32_t> imageSize() const { return rgb_ ? std::make_pair(width_ / 2, height_ / 2) : std::make_pair(width_, height_); }
 
@@ -97,6 +103,7 @@ private:
     std::map<uint32_t, Shading> shading_;
     uint32_t width_ = 0, height_ = 0;
     bool rgb_ = false;  // frames carry RGB cells (SPEC 3.8)
+    unsigned packBits_ = 16;  // DNG BitsPerSample
 };
 
 // SMPTE timecode string HH:MM:SS:FF for frame `index` at an integer fps.
