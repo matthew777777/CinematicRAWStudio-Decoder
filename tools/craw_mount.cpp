@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// craw_mount MOUNTPOINT clip1.craw [clip2.craw ...] [-f] [fuse options]
+// craw_mount MOUNTPOINT clip1.craw [clip2.craw ...] [--flat] [-f] [fuse options]
+//
+// --flat (single take): the DNGs and WAV sit directly in MOUNTPOINT instead of
+// MOUNTPOINT/<name>/.
 //
 // Read-only virtual filesystem that presents every .CRAW take as a CinemaDNG
 // folder, so DaVinci Resolve (or any CinemaDNG reader) opens it directly:
@@ -44,6 +47,7 @@ struct CachedFrame {
 };
 
 std::vector<MountedClip> gClips;
+bool gFlat = false;
 std::mutex gCacheMutex;
 std::list<CachedFrame> gCache;  // most recent first
 constexpr size_t kCacheFrames = 12;
@@ -61,6 +65,11 @@ struct Node {
 Node resolve(const char* path) {
     Node n;
     std::string p = path;
+    if (gFlat) {
+        // One take at the root: "/<name>/..." becomes "/...".
+        if (p == "/") { n.clip = &gClips.front(); n.kind = Node::Dir; return n; }
+        p = "/" + gClips.front().name + p;
+    }
     if (p == "/") { n.kind = Node::Root; return n; }
     if (p.front() == '/') p.erase(0, 1);
     const auto slash = p.find('/');
@@ -224,6 +233,7 @@ int main(int argc, char** argv) {
     std::vector<char*> fuseArgs{argv[0], argv[1]};
     for (int i = 2; i < argc; ++i) {
         const std::string a = argv[i];
+        if (a == "--flat") { gFlat = true; continue; }
         if (!a.empty() && a[0] == '-') { fuseArgs.push_back(argv[i]); continue; }
         try {
             MountedClip c;
@@ -247,7 +257,11 @@ int main(int argc, char** argv) {
         }
     }
     if (gClips.empty()) return 1;
-    std::string volname = "-ovolname=CRAW";
+    if (gFlat && gClips.size() != 1) {
+        std::fprintf(stderr, "--flat needs exactly one take\n");
+        return 2;
+    }
+    std::string volname = "-ovolname=" + (gFlat ? gClips.front().name : std::string("CRAW"));
     fuseArgs.push_back(const_cast<char*>("-o"));
     fuseArgs.push_back(const_cast<char*>("ro"));
     fuseArgs.push_back(volname.data());
