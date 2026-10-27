@@ -1,0 +1,383 @@
+// SPDX-License-Identifier: Apache-2.0
+#include "Clip.h"
+
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <cstring>
+
+namespace craw::tools {
+namespace {
+
+// ---- little-endian TIFF/DNG builder ----------------------------------------
+
+enum TiffType : uint16_t { BYTE = 1, ASCII = 2, SHORT = 3, LONG = 4, RATIONAL = 5, UNDEFINED = 7, SRATIONAL = 10 };
+
+struct Entry {
+    uint16_t tag, type;
+    uint32_t count;
+    std::vector<uint8_t> data;
+};
+
+template <typename T>
+void le(std::vector<uint8_t>& o, T v) {
+    for (size_t i = 0; i < sizeof(T); ++i) o.push_back(static_cast<uint8_t>(uint64_t(v) >> (8 * i)));
+}
+template <typename T>
+void be(std::vector<uint8_t>& o, T v) {
+    for (size_t i = sizeof(T); i-- > 0;) o.push_back(static_cast<uint8_t>(uint64_t(v) >> (8 * i)));
+}
+void beF32(std::vector<uint8_t>& o, float f) { uint32_t u; std::memcpy(&u, &f, 4); be(o, u); }
+void beF64(std::vector<uint8_t>& o, double d) { uint64_t u; std::memcpy(&u, &d, 8); be(o, u); }
+
+class Ifd {
+public:
+    void shorts(uint16_t tag, std::initializer_list<uint16_t> v) { Entry e{tag, SHORT, uint32_t(v.size()), {}}; for (auto x : v) le(e.data, x); add(e); }
+    void longs(uint16_t tag, const std::vector<uint32_t>& v) { Entry e{tag, LONG, uint32_t(v.size()), {}}; for (auto x : v) le(e.data, x); add(e); }
+    void bytes(uint16_t tag, std::vector<uint8_t> v, uint16_t type = BYTE) { Entry e{tag, type, uint32_t(v.size()), std::move(v)}; add(e); }
+    void raw(uint16_t tag, uint16_t type, uint32_t count, std::vector<uint8_t> v) { Entry e{tag, type, count, std::move(v)}; add(e); }
+    void ascii(uint16_t tag, const std::string& s) { std::vector<uint8_t> v(s.begin(), s.end()); v.push_back(0); bytes(tag, v, ASCII); }
+    void rationals(uint16_t tag, const std::vector<double>& v, bool sign) {
+        Entry e{tag, uint16_t(sign ? SRATIONAL : RATIONAL), uint32_t(v.size()), {}};
+        for (double x : v) {
+            const int32_t den = 1000000;
+            le(e.data, static_cast<int32_t>(std::llround(x * den)));
+            le(e.data, den);
+        }
+        add(e);
+    }
+    // Serializes at `offset`; `fixups` receives (position of a LONG value, entry tag) for strips.
+    std::vector<uint8_t> build(uint32_t offset, uint32_t stripOffset) {
+        std::sort(entries_.begin(), entries_.end(), [](const Entry& a, const Entry& b) { return a.tag < b.tag; });
+        for (auto& e : entries_)
+            if (e.tag == 273) { e.data.clear(); le(e.data, stripOffset); }
+        std::vector<uint8_t> out;
+        le<uint16_t>(out, static_cast<uint16_t>(entries_.size()));
+        uint32_t extra = offset + 2 + 12 * uint32_t(entries_.size()) + 4;
+        std::vector<uint8_t> blob;
+        for (auto& e : entries_) {
+            le(out, e.tag);
+            le(out, e.type);
+            le(out, e.count);
+            if (e.data.size() <= 4) {
+                auto d = e.data;
+                d.resize(4, 0);
+                out.insert(out.end(), d.begin(), d.end());
+            } else {
+                le(out, extra + uint32_t(blob.size()));
+                blob.insert(blob.end(), e.data.begin(), e.data.end());
+                if (blob.size() & 1) blob.push_back(0);
+            }
+        }
+        le<uint32_t>(out, 0);  // no next IFD
+        out.insert(out.end(), blob.begin(), blob.end());
+        return out;
+    }
+
+private:
+    void add(Entry& e) { entries_.push_back(std::move(e)); }
+    std::vector<Entry> entries_;
+};
+
+std::vector<double> numbers(const json::Value& v) {
+    std::vector<double> out;
+    if (!v.isArray()) return out;
+    for (const auto& x : v.a) {
+        if (x.isNumber()) out.push_back(x.n);
+        else if (x.isArray() && x.size() == 2 && x[1].num() != 0) out.push_back(x[0].num() / x[1].num());  // DNG rational pair
+    }
+    return out;
+}
+
+int cfaFromName(const std::string& s) {
+    std::string l;
+    for (char c : s) l += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    if (l == "grbg") return 1;
+    if (l == "gbrg") return 2;
+    if (l == "bggr") return 3;
+    return 0;
+}
+
+// Cell position (py * 2 + px) of R, Gr (green in the red row), Gb, B.
+std::array<int, 4> colourPositions(int cfa) {
+    static const int r[4] = {0, 1, 2, 3};    // R position per CFA
+    static const int b[4] = {3, 2, 1, 0};
+    const int rp = r[cfa], bp = b[cfa];
+    const int gr = (rp & 2) | (1 - (rp & 1));  // other column, red row
+    const int gb = (bp & 2) | (1 - (bp & 1));
+    return {rp, gr, gb, bp};
+}
+
+}  // namespace
+
+std::string timecode(int64_t index, int fps) {
+    fps = std::max(fps, 1);
+    const int64_t f = index % fps, s = index / fps;
+    char buf[16];
+    std::snprintf(buf, sizeof buf, "%02lld:%02lld:%02lld:%02lld", (long long)(s / 3600 % 24), (long long)(s / 60 % 60),
+                  (long long)(s % 60), (long long)f);
+    return buf;
+}
+
+Clip::Clip(const std::string& path) : reader_(path) {
+    const json::Value meta = json::parseOrEmpty(reader_.metaJson());
+    const json::Value& sensor = meta["sensor"];
+    const json::Value& camera = meta["camera"];
+    const json::Value& video = meta["video"];
+    const json::Value& extra = meta["extraData"];
+
+    // Camera identity.
+    info_.make = camera["make"].str(info_.make);
+    info_.model = camera["model"].str(info_.model);
+    const std::string unique = meta["uniqueCameraModel"].str(meta["UniqueCameraModel"].str());
+    if (!unique.empty()) {
+        info_.uniqueModel = unique;
+        const auto sp = unique.find(' ');
+        if (info_.make == "Unknown") info_.make = unique.substr(0, sp);
+        if (info_.model == "Unknown") info_.model = sp == std::string::npos ? unique : unique.substr(sp + 1);
+    } else if (info_.make != "Unknown") {
+        info_.uniqueModel = info_.make + " " + info_.model;
+    }
+
+    // Sensor.
+    info_.cfa = cfaFromName(sensor["cfa"].str(meta["sensorArrangment"].str("rggb")));
+    auto black = numbers(sensor["black_level"].isArray() ? sensor["black_level"] : meta["blackLevel"]);
+    if (black.size() == 1) black.assign(4, black[0]);
+    if (black.size() == 4) std::copy(black.begin(), black.end(), info_.black.begin());
+    info_.white = sensor["white_level"].num(meta["whiteLevel"].num(info_.white));
+    auto pick = [&](const char* spec, const char* flat) {
+        auto v = numbers(sensor[spec]);
+        return v.size() == 9 ? v : numbers(meta[flat]);
+    };
+    info_.colorMatrix1 = pick("color_matrix1", "colorMatrix1");
+    info_.colorMatrix2 = pick("color_matrix2", "colorMatrix2");
+    info_.forwardMatrix1 = pick("forward_matrix1", "forwardMatrix1");
+    info_.forwardMatrix2 = pick("forward_matrix2", "forwardMatrix2");
+    info_.calibration1 = pick("calibration1", "calibrationMatrix1");
+    info_.calibration2 = pick("calibration2", "calibrationMatrix2");
+    info_.illuminant1 = int(sensor["illuminant1"].num(meta["referenceIlluminant1"].num(21)));
+    info_.illuminant2 = int(sensor["illuminant2"].num(meta["referenceIlluminant2"].num(17)));
+    // Capture orientation only: sensorOrientation describes the sensor mount,
+    // and landscape video frames are already upright.
+    info_.orientationDeg = int(meta["orientation"].num(meta["video"]["orientation"].num(0)));
+
+    // Timing.
+    if (video["fps_num"].isNumber()) {
+        info_.fpsNum = video["fps_num"].num(30);
+        info_.fpsDen = std::max(1.0, video["fps_den"].num(1));
+    } else {
+        info_.fpsNum = extra["frameRate"].num(meta["fps"].num(30));
+        info_.fpsDen = 1;
+    }
+
+    // Chunks: lens shading maps, audio, first-frame geometry.
+    uint64_t wavData = 0;
+    for (const auto& c : reader_.chunks()) {
+        if (!c.crcOk) continue;
+        const auto p = reader_.payload(c);
+        const auto* b = reinterpret_cast<const uint8_t*>(p.data());
+        if (std::memcmp(c.fourcc.data(), "LSHD", 4) == 0 && p.size() >= 16) {
+            Shading sh;
+            uint32_t id;
+            std::memcpy(&id, b + 8, 4);
+            std::memcpy(&sh.columns, b + 12, 2);
+            std::memcpy(&sh.rows, b + 14, 2);
+            const size_t n = size_t{sh.columns} * sh.rows * 4;
+            if (n == 0 || p.size() != 16 + 4 * n) continue;
+            sh.gains.resize(n);
+            std::memcpy(sh.gains.data(), b + 16, 4 * n);
+            shading_[id] = std::move(sh);
+        } else if (std::memcmp(c.fourcc.data(), "AUDI", 4) == 0 && p.size() >= 20) {
+            const int fmt = b[8], ch = b[9];
+            uint32_t rate, frames;
+            std::memcpy(&rate, b + 12, 4);
+            std::memcpy(&frames, b + 16, 4);
+            const size_t bps = fmt == 1 ? 2 : fmt == 3 ? 3 : 4;
+            const size_t bytes = size_t{frames} * ch * bps;
+            if (ch == 0 || bytes != p.size() - 20) continue;
+            if (audio_.format == 0) { audio_.format = fmt; audio_.channels = ch; audio_.sampleRate = rate; }
+            if (fmt != audio_.format || ch != audio_.channels || rate != audio_.sampleRate) continue;  // keep one stream
+            audioParts_.push_back({wavData, b + 20, bytes});
+            wavData += bytes;
+            audio_.frames += frames;
+        }
+    }
+    if (reader_.frameCount() > 0) {
+        const auto rec = reader_.frame(0);
+        const auto fi = probeFrame(rec.payload, rec.payloadSize);
+        width_ = fi.width;
+        height_ = fi.height;
+    }
+    if (audio_.format != 0) {
+        const bool f = audio_.format == 2;
+        const uint16_t bits = audio_.format == 1 ? 16 : audio_.format == 3 ? 24 : 32;
+        const uint16_t align = static_cast<uint16_t>(audio_.channels * bits / 8);
+        auto& h = wavHeader_;
+        auto tag = [&](const char* t) { h.insert(h.end(), t, t + 4); };
+        tag("RIFF"); le<uint32_t>(h, static_cast<uint32_t>(std::min<uint64_t>(36 + wavData, 0xFFFFFFFFu))); tag("WAVE");
+        tag("fmt "); le<uint32_t>(h, 16); le<uint16_t>(h, f ? 3 : 1); le<uint16_t>(h, static_cast<uint16_t>(audio_.channels));
+        le<uint32_t>(h, audio_.sampleRate); le<uint32_t>(h, audio_.sampleRate * align); le<uint16_t>(h, align); le<uint16_t>(h, bits);
+        tag("data"); le<uint32_t>(h, static_cast<uint32_t>(std::min<uint64_t>(wavData, 0xFFFFFFFFu)));
+    }
+}
+
+uint64_t Clip::wavSize() const {
+    if (audio_.format == 0) return 0;
+    uint64_t n = wavHeader_.size();
+    for (const auto& p : audioParts_) n += p.size;
+    return n;
+}
+
+size_t Clip::readWav(uint64_t offset, uint8_t* dst, size_t len) const {
+    size_t done = 0;
+    while (done < len) {
+        const uint64_t at = offset + done;
+        if (at < wavHeader_.size()) {
+            const size_t n = std::min<size_t>(len - done, wavHeader_.size() - at);
+            std::memcpy(dst + done, wavHeader_.data() + at, n);
+            done += n;
+            continue;
+        }
+        const uint64_t dataAt = at - wavHeader_.size();
+        auto it = std::upper_bound(audioParts_.begin(), audioParts_.end(), dataAt,
+                                   [](uint64_t v, const AudioPart& p) { return v < p.wavOffset; });
+        if (it == audioParts_.begin()) break;
+        --it;
+        const uint64_t within = dataAt - it->wavOffset;
+        if (within >= it->size) break;
+        const size_t n = std::min<size_t>(len - done, it->size - within);
+        std::memcpy(dst + done, it->data + within, n);
+        done += n;
+    }
+    return done;
+}
+
+uint64_t Clip::paddedDngSize(uint32_t padTo) const { return uint64_t{padTo} + uint64_t{width_} * height_ * 2; }
+
+std::vector<uint8_t> Clip::frameDng(size_t i, uint32_t padTo, unsigned threads) const {
+    const FrameRecord rec = reader_.frame(i);
+    std::vector<uint16_t> pixels;
+    const FrameInfo fi = decodeFrame(rec.payload, rec.payloadSize, pixels, threads);
+    const json::Value fm = json::parseOrEmpty(rec.metaJson);
+
+    Ifd ifd;
+    ifd.longs(254, {0});
+    ifd.longs(256, {fi.width});
+    ifd.longs(257, {fi.height});
+    ifd.shorts(258, {16});
+    ifd.shorts(259, {1});
+    ifd.shorts(262, {32803});
+    ifd.ascii(271, info_.make);
+    ifd.ascii(272, info_.model);
+    ifd.longs(273, {0});  // strip offset, patched in build()
+    const int deg = ((info_.orientationDeg % 360) + 360) % 360;
+    ifd.shorts(274, {static_cast<uint16_t>(deg == 90 ? 6 : deg == 180 ? 3 : deg == 270 ? 8 : 1)});
+    ifd.shorts(277, {1});
+    ifd.longs(278, {fi.height});
+    ifd.longs(279, {fi.width * fi.height * 2});
+    ifd.shorts(284, {1});
+    ifd.ascii(305, "Cinematic RAW Studio craw2dng");
+    ifd.shorts(33421, {2, 2});
+    static const uint8_t pattern[4][4] = {{0, 1, 1, 2}, {1, 0, 2, 1}, {1, 2, 0, 1}, {2, 1, 1, 0}};
+    const int cfa = static_cast<int>(fi.cfa);
+    ifd.bytes(33422, {pattern[cfa][0], pattern[cfa][1], pattern[cfa][2], pattern[cfa][3]});
+    if (fm["exposureTime"].isNumber()) {
+        const double ns = fm["exposureTime"].num();
+        ifd.rationals(33434, {ns > 1000 ? ns / 1e9 : ns}, false);  // RawLens stores ns
+    }
+    if (fm["iso"].isNumber()) ifd.shorts(34855, {static_cast<uint16_t>(std::clamp(fm["iso"].num(), 1.0, 65535.0))});
+    ifd.bytes(50706, {1, 4, 0, 0});
+    ifd.bytes(50707, {1, 1, 0, 0});
+    ifd.ascii(50708, info_.uniqueModel);
+    ifd.shorts(50713, {2, 2});
+    std::vector<double> black(info_.black.begin(), info_.black.end());
+    if (auto dyn = numbers(fm["dynamicBlackLevel"]); dyn.size() == 4) black = dyn;
+    ifd.rationals(50714, black, false);
+    ifd.longs(50717, {static_cast<uint32_t>(fm["dynamicWhiteLevel"].num(info_.white))});
+    static const std::vector<double> identity{1, 0, 0, 0, 1, 0, 0, 0, 1};
+    ifd.rationals(50721, info_.colorMatrix1.size() == 9 ? info_.colorMatrix1 : identity, true);
+    if (info_.colorMatrix2.size() == 9) ifd.rationals(50722, info_.colorMatrix2, true);
+    if (info_.calibration1.size() == 9) ifd.rationals(50723, info_.calibration1, true);
+    if (info_.calibration2.size() == 9) ifd.rationals(50724, info_.calibration2, true);
+    if (auto n = numbers(fm["asShotNeutral"]); n.size() == 3) ifd.rationals(50728, n, false);
+    ifd.shorts(50778, {static_cast<uint16_t>(info_.illuminant1)});
+    if (info_.colorMatrix2.size() == 9) ifd.shorts(50779, {static_cast<uint16_t>(info_.illuminant2)});
+    if (info_.forwardMatrix1.size() == 9) ifd.rationals(50964, info_.forwardMatrix1, true);
+    if (info_.forwardMatrix2.size() == 9) ifd.rationals(50965, info_.forwardMatrix2, true);
+
+    // Lens shading -> OpcodeList2 GainMap, one opcode per CFA phase.
+    uint16_t cols = 0, rows = 0;
+    std::vector<float> gains;  // colour order R, Gr, Gb, B, 4 per point
+    if (fm["lshd_ref"].isNumber()) {
+        const auto it = shading_.find(static_cast<uint32_t>(fm["lshd_ref"].num()));
+        if (it != shading_.end()) { cols = it->second.columns; rows = it->second.rows; gains = it->second.gains; }
+    } else if (fm["lensShadingMap"].isArray() && fm["lensShadingMap"].size() == 4) {
+        cols = static_cast<uint16_t>(fm["lensShadingMapWidth"].num());
+        rows = static_cast<uint16_t>(fm["lensShadingMapHeight"].num());
+        const size_t pts = size_t{cols} * rows;
+        gains.assign(pts * 4, 1.f);
+        bool ok = pts > 0;
+        for (int ch = 0; ch < 4 && ok; ++ch) {
+            const auto& plane = fm["lensShadingMap"][ch];
+            ok = plane.size() == pts;
+            for (size_t k = 0; ok && k < pts; ++k) gains[k * 4 + ch] = static_cast<float>(plane[k].num(1));
+        }
+        if (!ok) { cols = rows = 0; gains.clear(); }
+    }
+    if (cols > 0 && rows > 0) {
+        std::vector<uint8_t> ops;
+        be<uint32_t>(ops, 4);
+        const auto pos = colourPositions(cfa);
+        for (int ch = 0; ch < 4; ++ch) {
+            std::vector<uint8_t> p;
+            be<uint32_t>(p, static_cast<uint32_t>(pos[ch] >> 1));  // top
+            be<uint32_t>(p, static_cast<uint32_t>(pos[ch] & 1));   // left
+            be<uint32_t>(p, fi.height);
+            be<uint32_t>(p, fi.width);
+            be<uint32_t>(p, 0); be<uint32_t>(p, 1);  // plane, planes
+            be<uint32_t>(p, 2); be<uint32_t>(p, 2);  // row/col pitch
+            be<uint32_t>(p, rows); be<uint32_t>(p, cols);
+            beF64(p, 1.0 / rows); beF64(p, 1.0 / cols);          // spacing (relative)
+            beF64(p, 0.5 / rows); beF64(p, 0.5 / cols);          // origin: cell centres
+            be<uint32_t>(p, 1);                                  // map planes
+            for (size_t k = 0; k < size_t{cols} * rows; ++k) beF32(p, gains[k * 4 + ch]);
+            be<uint32_t>(ops, 9);                // GainMap
+            ops.insert(ops.end(), {1, 3, 0, 0}); // DNG 1.3
+            be<uint32_t>(ops, 0);                // flags
+            be<uint32_t>(ops, static_cast<uint32_t>(p.size()));
+            ops.insert(ops.end(), p.begin(), p.end());
+        }
+        ifd.bytes(51009, std::move(ops), UNDEFINED);
+    }
+
+    // CinemaDNG: timecode + frame rate.
+    const int fpsInt = std::max(1, static_cast<int>(std::lround(info_.fpsNum / info_.fpsDen)));
+    {
+        const int64_t idx = static_cast<int64_t>(i) + info_.timecodeStartFrames;
+        const int64_t f = idx % fpsInt, s = idx / fpsInt;
+        auto bcd = [](int64_t v) { return static_cast<uint8_t>(((v / 10) << 4) | (v % 10)); };
+        ifd.bytes(51043, {bcd(f), bcd(s % 60), bcd(s / 60 % 60), bcd(s / 3600 % 24), 0, 0, 0, 0});
+    }
+    {
+        std::vector<uint8_t> rate;
+        le(rate, static_cast<int32_t>(std::lround(info_.fpsNum)));
+        le(rate, static_cast<int32_t>(info_.fpsDen));
+        ifd.raw(51044, SRATIONAL, 1, std::move(rate));
+    }
+
+    // Layout: header (8) | IFD + blobs | [pad] | pixels.
+    std::vector<uint8_t> out{'I', 'I', 42, 0, 8, 0, 0, 0};
+    auto ifdBytes = ifd.build(8, 0);
+    uint32_t stripOffset = (static_cast<uint32_t>(8 + ifdBytes.size()) + 1) & ~1u;
+    if (padTo > 0) stripOffset = padTo;
+    ifdBytes = ifd.build(8, stripOffset);
+    if (padTo > 0 && 8 + ifdBytes.size() > padTo) throw DecodeError("craw2dng: DNG header exceeds padding");
+    out.insert(out.end(), ifdBytes.begin(), ifdBytes.end());
+    out.resize(stripOffset, 0);
+    const size_t px = pixels.size() * 2;
+    out.resize(stripOffset + px);
+    std::memcpy(out.data() + stripOffset, pixels.data(), px);  // little-endian host
+    return out;
+}
+
+}  // namespace craw::tools

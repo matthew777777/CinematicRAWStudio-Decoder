@@ -27,6 +27,25 @@ endif()
 if(CRAW_BUILD_TOOLS)
     add_executable(craw_dec tools/craw_dec.cpp)
     target_link_libraries(craw_dec PRIVATE CRAW::Decoder)
+
+    # DaVinci Resolve workflow: CinemaDNG export and a virtual CinemaDNG mount.
+    add_library(CrawClip STATIC tools/common/Clip.cpp)
+    target_link_libraries(CrawClip PUBLIC CRAW::Decoder)
+    add_executable(craw2dng tools/craw2dng.cpp)
+    target_link_libraries(craw2dng PRIVATE CrawClip)
+
+    find_path(FUSE_T_INCLUDE fuse.h PATHS "/Library/Application Support/fuse-t/include/fuse"
+              /usr/local/include/fuse /usr/include/fuse NO_DEFAULT_PATH)
+    find_library(FUSE_T_LIB NAMES fuse-t fuse PATHS /usr/local/lib /usr/lib)
+    if(FUSE_T_INCLUDE AND FUSE_T_LIB)
+        add_executable(craw_mount tools/craw_mount.cpp)
+        target_include_directories(craw_mount PRIVATE ${FUSE_T_INCLUDE})
+        target_compile_definitions(craw_mount PRIVATE FUSE_USE_VERSION=26 _FILE_OFFSET_BITS=64)
+        target_link_libraries(craw_mount PRIVATE CrawClip ${FUSE_T_LIB})
+        message(STATUS "craw_mount: FUSE at ${FUSE_T_LIB}")
+    else()
+        message(STATUS "craw_mount: FUSE not found (install fuse-t or libfuse), skipped")
+    endif()
 endif()
 
 if(CRAW_BUILD_TESTS)

@@ -1,0 +1,78 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// A .CRAW take as CinemaDNG: per-frame DNG files and one WAV file, used by
+// craw2dng and craw_mount. Accepts both the SPEC.md META layout
+// ("sensor"/"lens"/"video") and the flat RawLens keys (blackLevel,
+// colorMatrix1, sensorArrangment, ...).
+#pragma once
+
+#include <craw/Reader.h>
+
+#include "Json.h"
+
+#include <array>
+#include <cstdint>
+#include <map>
+#include <string>
+#include <vector>
+
+namespace craw::tools {
+
+struct ClipInfo {
+    std::string make = "Unknown", model = "Unknown", uniqueModel = "Cinematic RAW Studio";
+    int cfa = 0;  // 0 RGGB, 1 GRBG, 2 GBRG, 3 BGGR
+    std::array<double, 4> black{0, 0, 0, 0};  // 2x2 row-major
+    double white = 65535;
+    std::vector<double> colorMatrix1, colorMatrix2, forwardMatrix1, forwardMatrix2, calibration1, calibration2;
+    int illuminant1 = 21, illuminant2 = 17;
+    int orientationDeg = 0;
+    double fpsNum = 30, fpsDen = 1;
+    int timecodeStartFrames = 0;
+};
+
+struct AudioInfo {
+    int format = 0;  // AUDI: 1 S16, 2 F32, 3 S24; 0 = no audio
+    int channels = 0;
+    uint32_t sampleRate = 0;
+    uint64_t frames = 0;  // per channel
+};
+
+class Clip {
+public:
+    explicit Clip(const std::string& path);
+
+    const ClipInfo& info() const { return info_; }
+    size_t frameCount() const { return reader_.frameCount(); }
+    const Reader& reader() const { return reader_; }
+
+    // DNG for frame `i`. With `padTo` > 0 the image data starts at offset
+    // `padTo` (so every frame of a clip has the same size; craw_mount needs
+    // sizes before decoding). Throws DecodeError.
+    std::vector<uint8_t> frameDng(size_t i, uint32_t padTo = 0, unsigned threads = 1) const;
+
+    // Size of every padded DNG of this clip (all frames share dimensions).
+    uint64_t paddedDngSize(uint32_t padTo) const;
+    std::pair<uint32_t, uint32_t> frameSize() const { return {width_, height_}; }
+
+    const AudioInfo& audio() const { return audio_; }
+    uint64_t wavSize() const;
+    // Reads `len` bytes of the WAV file at `offset` (header + concatenated AUDI samples).
+    size_t readWav(uint64_t offset, uint8_t* dst, size_t len) const;
+
+private:
+    struct AudioPart { uint64_t wavOffset; const uint8_t* data; size_t size; };
+    struct Shading { uint16_t columns = 0, rows = 0; std::vector<float> gains; };
+
+    Reader reader_;
+    ClipInfo info_;
+    AudioInfo audio_;
+    std::vector<AudioPart> audioParts_;
+    std::vector<uint8_t> wavHeader_;
+    std::map<uint32_t, Shading> shading_;
+    uint32_t width_ = 0, height_ = 0;
+};
+
+// SMPTE timecode string HH:MM:SS:FF for frame `index` at an integer fps.
+std::string timecode(int64_t index, int fps);
+
+}  // namespace craw::tools
