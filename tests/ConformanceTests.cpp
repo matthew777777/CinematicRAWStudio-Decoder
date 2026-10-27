@@ -44,13 +44,16 @@ int main(int argc, char** argv) {
             }
         }
         // Every single-byte corruption must throw (CRC or structural check).
+        // Frames without a frame CRC rely on the container's chunk CRC32C
+        // (checked by Reader), so only structural rejection is required here.
+        const bool hasCrc = craw::probeFrame(payload.data(), payload.size()).hasCrc;
         size_t silent = 0;
         for (size_t i = 0; i < payload.size(); i += std::max<size_t>(1, payload.size() / 512)) {
             auto bad = payload;
             bad[i] ^= 0x5A;
             try {
                 craw::decodeFrame(bad.data(), bad.size(), out, 1);
-                if (out != expect) ++silent;
+                if (out != expect && hasCrc) ++silent;
             } catch (const craw::DecodeError&) {
             }
         }
