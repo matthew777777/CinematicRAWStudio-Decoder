@@ -15,27 +15,47 @@ License: Apache-2.0.
 
 ## DaVinci Resolve workflow
 
-Resolve imports CinemaDNG natively. Two lossless ways to get there:
+End users: see **GETTING_STARTED.md** in CinematicRAWStudio-Spec — the
+installer sets up one-click mounting (`CRAW Mount.app`, `craw-mount`).
 
-**Mount (no conversion, no extra disk):** requires [fuse-t](https://www.fuse-t.org)
-(kext-free FUSE for macOS) or libfuse on Linux.
+### craw_mount (FUSE: fuse-t on macOS, libfuse 2 on Linux, WinFsp on Windows)
 
 ```
-mkdir -p ~/CRAW
-./build/craw_mount ~/CRAW /path/to/IMG_..._VID.craw [more.craw ...]   # -f to stay in foreground
-# In Resolve: Media page -> ~/CRAW/<clip>/ -> drag the folder in (DNG sequence + WAV)
-umount ~/CRAW
+craw_mount MOUNTPOINT take.craw --flat [-f]        # one take, files at the root
+craw_mount MOUNTPOINT a.craw b.craw [-f]           # several takes, one folder each
+umount MOUNTPOINT                                  # (Linux: fusermount -u)
 ```
+- Read-only; every take shows `<name>_NNNNNN.dng` and `<name>.wav`.
+- DNGs are built on demand with an LRU cache and 4-frame read-ahead; every
+  frame of a take has the same size (pixel data at a fixed padded offset), so
+  listings need no decoding.
+- Without `-f` it daemonises; `-f` keeps it in the foreground (logs to stderr).
 
-Each take appears as `<name>/<name>_000000.dng ... <name>.wav`; DNGs are
-decoded on demand with read-ahead (about 24 fps sequential for 4080x2040 on an
-M-series Mac).
+### craw2dng
 
-**Export:** `./build/craw2dng clip.craw out_dir [--frames 0-99] [--no-audio]`
-writes the same files to disk.
+```
+craw2dng take.craw OUT_DIR [--frames FIRST-LAST] [--no-audio] [--threads N]
+```
+Writes `OUT_DIR/<name>/<name>_NNNNNN.dng` and `<name>.wav`.
 
-DNG contents: CFA pixels bit-exact to the recording, black/white levels,
-ColorMatrix/ForwardMatrix/CameraCalibration 1+2 with illuminants,
-AsShotNeutral, ISO and exposure time, CinemaDNG FrameRate + TimeCodes, and the
-lens-shading/vignetting map as DNG OpcodeList2 GainMap (one per CFA phase).
-Audio: WAV in the recorded format (32-bit float or 16-bit PCM).
+### DNG contents (both tools)
+
+CFA pixels bit-exact to the recording · CFAPattern · BlackLevel (2x2, dynamic
+per frame when recorded) · WhiteLevel · ColorMatrix/ForwardMatrix/
+CameraCalibration 1+2 with illuminants · AsShotNeutral · ISO · ExposureTime ·
+CinemaDNG FrameRate + TimeCodes · lens-shading map as OpcodeList2 GainMap
+(one per CFA phase) · orientation only from an explicit capture `orientation`
+key (landscape video is never rotated by the sensor mount angle). Metadata is
+read from the SPEC.md META layout or the flat RawLens keys.
+
+### FSKit module (macOS 26+, no FUSE)
+
+`tools/fskit` — `mount -F -t crawfs take.craw MOUNTPOINT`. Requires an Apple
+Development certificate and provisioning profile; see `tools/fskit/README.md`.
+
+### Verified (macOS)
+
+8 real 4080x2040 frames: DNG pixels byte-identical to the source both exported
+and mounted; LibRaw (`dcraw_emu`) develops them; exiftool shows all tags;
+float32 stereo WAV reads correctly; sequential reads ~42 ms/frame through the
+mount.
