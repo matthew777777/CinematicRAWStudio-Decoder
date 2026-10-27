@@ -24,7 +24,7 @@ Reader::Reader(const std::string& path) {
     const uint8_t* d = data_.data();
     const size_t n = data_.size();
     if (n < 16 || std::memcmp(d, "CRAW", 4) != 0) throw DecodeError("craw: not a CRAW file");
-    if ((d[4] | d[5] << 8) != 0) throw DecodeError("craw: unsupported major version");
+    if ((d[4] | d[5] << 8) != 0 || (d[6] | d[7] << 8) < 2) throw DecodeError("craw: unsupported major version");
 
     // Scan every chunk: cheap (headers only) and works for crashed files too.
     bool sawIndex = false;

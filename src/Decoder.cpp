@@ -16,8 +16,8 @@ namespace {
 
 constexpr int kRiceLimit = 24;
 constexpr int kEscapeBits = 24;
-constexpr int kMaxK = 20;
-constexpr int kContexts = 16;
+constexpr int kBlock = 16;
+constexpr int kMaxBlockK = 16;
 constexpr size_t kHeaderSize = 24;
 
 // Coded plane order G1, G2, R, B -> position in the 2x2 cell (py * 2 + px).
@@ -73,37 +73,50 @@ private:
     int n_ = 0;
 };
 
-void decodePlane(BitReader& br, int32_t* p, int w, int h, int32_t firstPred, uint32_t riceInit) {
-    uint32_t A[kContexts], N[kContexts];
-    std::fill(A, A + kContexts, riceInit);
-    std::fill(N, N + kContexts, 1u);
+inline int32_t med(int32_t a, int32_t b, int32_t c) {
+    const int32_t mx = std::max(a, b), mn = std::min(a, b);
+    return c >= mx ? mn : c <= mn ? mx : a + b - c;
+}
+
+// SPEC 3.4: Rice parameter from causal block sums (`up` / `left` < 0 = absent).
+inline int blockK(int64_t up, int64_t left, uint32_t riceInit) {
+    int64_t s;
+    if (up >= 0 && left >= 0) s = up + left;
+    else if (up >= 0) s = 2 * up;
+    else if (left >= 0) s = 2 * left;
+    else s = int64_t{riceInit} * 2 * kBlock;
+    const uint64_t v = (static_cast<uint64_t>(s) * 11) >> 4;
+    return std::min(static_cast<int>(std::bit_width((v >> 5) + 1)) - 1, kMaxBlockK);
+}
+
+void decodePlane(BitReader& br, int32_t* p, int w, int h, int32_t firstPred, uint32_t riceInit,
+                 std::vector<int64_t>& sums) {
+    const int blocks = (w + kBlock - 1) / kBlock;
+    sums.assign(2 * blocks, -1);
+    int64_t* prevSums = sums.data();
+    int64_t* curSums = sums.data() + blocks;
     for (int y = 0; y < h; ++y) {
         int32_t* row = p + y * w;
         const int32_t* up = row - w;
-        for (int x = 0; x < w; ++x) {
-            int32_t pred;
-            int ctx = 0;
-            if (x == 0 && y == 0) {
-                pred = firstPred;
-            } else {
-                int32_t a, b, c;
-                if (y == 0) a = b = c = row[x - 1];
-                else if (x == 0) a = b = c = up[0];
-                else { a = row[x - 1]; b = up[x]; c = up[x - 1]; }
-                const int32_t mx = std::max(a, b), mn = std::min(a, b);
-                pred = c >= mx ? mn : c <= mn ? mx : a + b - c;
-                const uint32_t g = static_cast<uint32_t>(std::abs(a - c) + std::abs(b - c));
-                ctx = std::min(static_cast<int>(std::bit_width(g)), kContexts - 1);
+        for (int bx = 0; bx < blocks; ++bx) {
+            const int x0 = bx * kBlock, n = std::min(kBlock, w - x0);
+            const int k = blockK(y > 0 ? prevSums[bx] * kBlock / n : -1, bx > 0 ? curSums[bx - 1] : -1,
+                                 riceInit);
+            int64_t s = 0;
+            for (int x = x0; x < x0 + n; ++x) {
+                const int q = br.zeros(kRiceLimit);
+                const uint32_t u = q < kRiceLimit ? (uint32_t(q) << k) | br.get(k) : br.get(kEscapeBits);
+                s += u;
+                const int32_t e = (u & 1) ? -static_cast<int32_t>((u + 1) >> 1) : static_cast<int32_t>(u >> 1);
+                int32_t pred;
+                if (y == 0) pred = x == 0 ? firstPred : row[x - 1];
+                else if (x == 0) pred = up[0];
+                else pred = med(row[x - 1], up[x], up[x - 1]);
+                row[x] = pred + e;
             }
-            int k = 0;
-            while ((N[ctx] << k) < A[ctx] && k < kMaxK) ++k;
-            const int q = br.zeros(kRiceLimit);
-            const uint32_t u = q < kRiceLimit ? (uint32_t(q) << k) | br.get(k) : br.get(kEscapeBits);
-            const int32_t e = (u & 1) ? -static_cast<int32_t>((u + 1) >> 1) : static_cast<int32_t>(u >> 1);
-            row[x] = pred + e;
-            A[ctx] += u;
-            if (++N[ctx] == 64) { A[ctx] >>= 1; N[ctx] >>= 1; }
+            curSums[bx] = s;
         }
+        std::swap(prevSums, curSums);
     }
 }
 
@@ -150,6 +163,7 @@ FrameInfo decodeFrame(const uint8_t* p, size_t size, std::vector<uint16_t>& out,
 
     auto worker = [&] {
         std::vector<int32_t> planes;
+        std::vector<int64_t> sums;
         for (uint32_t t; (t = next.fetch_add(1)) < count;) {
             try {
                 const uint32_t tx = (t % tilesX) * f.tile, ty = (t / tilesX) * f.tile;
@@ -166,7 +180,7 @@ FrameInfo decodeFrame(const uint8_t* p, size_t size, std::vector<uint16_t>& out,
                     BitReader br(d + 1, len - 1);
                     for (int i = 0; i < 4; ++i)
                         decodePlane(br, planes.data() + i * n, tw, th, i == 0 ? (1 << (f.bitDepth - 1)) : 0,
-                                    f.riceInit);
+                                    f.riceInit, sums);
                     if (br.overrun) throw DecodeError("craw: tile bit stream overrun");
                     for (int i = 1; i < 4; ++i)
                         for (size_t s = 0; s < n; ++s) planes[i * n + s] += planes[s];
