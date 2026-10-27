@@ -194,7 +194,7 @@ Clip::Clip(const std::string& path) : reader_(path) {
             std::memcpy(&frames, b + 16, 4);
             const size_t bps = fmt == 1 ? 2 : fmt == 3 ? 3 : 4;
             const size_t bytes = size_t{frames} * ch * bps;
-            if (ch == 0 || bytes != p.size() - 20) continue;
+            if (fmt < 1 || fmt > 3 || ch == 0 || rate == 0 || bytes != p.size() - 20) continue;
             if (audio_.format == 0) { audio_.format = fmt; audio_.channels = ch; audio_.sampleRate = rate; }
             if (fmt != audio_.format || ch != audio_.channels || rate != audio_.sampleRate) continue;  // keep one stream
             // WAV is always integer PCM (NLEs handle float WAV poorly): F32 -> 24-bit.
@@ -222,7 +222,7 @@ Clip::Clip(const std::string& path) : reader_(path) {
         std::memcpy(bext.data(), desc, sizeof desc - 1);          // Description[256]
         std::memcpy(bext.data() + 256, desc, sizeof desc - 1);    // Originator[32]
         bext[346] = 1;                                            // Version (after TimeReference u64 at 338)
-        const uint32_t riff = static_cast<uint32_t>(std::min<uint64_t>(4 + 8 + 16 + 8 + bext.size() + 8 + wavData, 0xFFFFFFFFu));
+        const uint32_t riff = static_cast<uint32_t>(std::min<uint64_t>(4 + 8 + 16 + 8 + bext.size() + 8 + wavData + (wavData & 1), 0xFFFFFFFFu));
         tag("RIFF"); le<uint32_t>(h, riff); tag("WAVE");
         tag("fmt "); le<uint32_t>(h, 16); le<uint16_t>(h, 1); le<uint16_t>(h, static_cast<uint16_t>(audio_.channels));
         le<uint32_t>(h, audio_.sampleRate); le<uint32_t>(h, audio_.sampleRate * align); le<uint16_t>(h, align); le<uint16_t>(h, bits);
@@ -235,7 +235,7 @@ uint64_t Clip::wavSize() const {
     if (audio_.format == 0) return 0;
     uint64_t n = wavHeader_.size();
     for (const auto& p : audioParts_) n += p.size;
-    return n;
+    return n + ((n - wavHeader_.size()) & 1);
 }
 
 size_t Clip::readWav(uint64_t offset, uint8_t* dst, size_t len) const {
@@ -254,7 +254,14 @@ size_t Clip::readWav(uint64_t offset, uint8_t* dst, size_t len) const {
         if (it == audioParts_.begin()) break;
         --it;
         const uint64_t within = dataAt - it->wavOffset;
-        if (within >= it->size) break;
+        if (within >= it->size) {
+            // RIFF chunks are padded to an even byte count; data length
+            // excludes this byte. Also serve partial reads of the padding.
+            if (within == it->size && (dataAt & 1) && at + 1 == wavSize()) {
+                dst[done++] = 0;
+            }
+            break;
+        }
         const size_t n = std::min<size_t>(len - done, it->size - within);
         if (audio_.format == 2) {
             // float32 -> 24-bit PCM, byte by byte so any offset/length works.
@@ -262,7 +269,7 @@ size_t Clip::readWav(uint64_t offset, uint8_t* dst, size_t len) const {
                 const uint64_t o = within + k;
                 float f;
                 std::memcpy(&f, it->data + o / 3 * 4, 4);
-                const double v = std::clamp(static_cast<double>(f), -1.0, 1.0) * 8388607.0;
+                const double v = (std::isnan(f) ? 0.0 : std::clamp(static_cast<double>(f), -1.0, 1.0)) * 8388607.0;
                 const int32_t q = static_cast<int32_t>(std::lround(v));
                 dst[done + k] = static_cast<uint8_t>(static_cast<uint32_t>(q) >> (8 * (o % 3)));
             }

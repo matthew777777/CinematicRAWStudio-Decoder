@@ -59,3 +59,17 @@ Development certificate and provisioning profile; see `tools/fskit/README.md`.
 and mounted; LibRaw (`dcraw_emu`) develops them; exiftool shows all tags;
 float32 stereo WAV reads correctly; sequential reads ~42 ms/frame through the
 mount.
+
+## Recording codec and audio compatibility
+
+Both CRAW-Live (codec 2) and CRAW-Fast (codec 1) decode to the original RAW
+samples. Payloads without a frame CRC rely on the container chunk CRC32C.
+WAV exports use integer PCM, retaining 16/24-bit source precision and
+converting float to 24-bit. They include Broadcast WAV timecode and RIFF
+padding for odd-length audio. NaN float samples become silence; infinities
+clip to full scale. `ctest --test-dir build-release --output-on-failure`
+checks conformance and WAV output, including arbitrary partial reads used
+by the virtual mount.
+
+In Resolve, place the video and WAV at the same timeline start. See the
+[sibling getting-started guide](../CinematicRAWStudio-Spec/GETTING_STARTED.md).
