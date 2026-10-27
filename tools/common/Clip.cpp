@@ -209,6 +209,7 @@ Clip::Clip(const std::string& path) : reader_(path) {
         const auto fi = probeFrame(rec.payload, rec.payloadSize);
         width_ = fi.width;
         height_ = fi.height;
+        rgb_ = fi.cfa == Cfa::RGB;
     }
     if (audio_.format != 0) {
         const uint16_t bits = audio_.format == 1 ? 16 : 24;
@@ -321,35 +322,57 @@ RawFrame Clip::frameRaw(size_t i, unsigned threads) const {
     return out;
 }
 
-uint64_t Clip::paddedDngSize(uint32_t padTo) const { return uint64_t{padTo} + uint64_t{width_} * height_ * 2; }
+uint64_t Clip::paddedDngSize(uint32_t padTo) const {
+    // RGB frames: (W/2 x H/2) pixels x 3 samples x 2 bytes.
+    return uint64_t{padTo} + (rgb_ ? uint64_t{width_ / 2} * (height_ / 2) * 6 : uint64_t{width_} * height_ * 2);
+}
 
 std::vector<uint8_t> Clip::frameDng(size_t i, uint32_t padTo, unsigned threads) const {
     const FrameRecord rec = reader_.frame(i);
     std::vector<uint16_t> pixels;
     const FrameInfo fi = decodeFrame(rec.payload, rec.payloadSize, pixels, threads);
     const json::Value fm = json::parseOrEmpty(rec.metaJson);
+    // RGB frames (SPEC 3.8) become LinearRaw DNGs: W x H pixels, 3 samples each.
+    const bool rgb = fi.cfa == Cfa::RGB;
+    const uint32_t outW = rgb ? fi.width / 2 : fi.width, outH = rgb ? fi.height / 2 : fi.height;
+    const uint32_t spp = rgb ? 3 : 1;
+    if (rgb) {
+        std::vector<uint16_t> inter(size_t{outW} * outH * 3);
+        for (uint32_t y = 0; y < outH; ++y)
+            for (uint32_t x = 0; x < outW; ++x) {
+                const uint16_t* r0 = pixels.data() + size_t{2 * y} * fi.width + 2 * x;
+                uint16_t* o = inter.data() + (size_t{y} * outW + x) * 3;
+                o[0] = r0[0];             // R  cell (0,0)
+                o[1] = r0[1];             // G  cell (0,1)
+                o[2] = r0[fi.width];      // B  cell (1,0)
+            }
+        pixels.swap(inter);
+    }
 
     Ifd ifd;
     ifd.longs(254, {0});
-    ifd.longs(256, {fi.width});
-    ifd.longs(257, {fi.height});
-    ifd.shorts(258, {16});
+    ifd.longs(256, {outW});
+    ifd.longs(257, {outH});
+    if (rgb) ifd.shorts(258, {16, 16, 16});
+    else ifd.shorts(258, {16});
     ifd.shorts(259, {1});
-    ifd.shorts(262, {32803});
+    ifd.shorts(262, {static_cast<uint16_t>(rgb ? 34892 : 32803)});
     ifd.ascii(271, info_.make);
     ifd.ascii(272, info_.model);
     ifd.longs(273, {0});  // strip offset, patched in build()
     const int deg = ((info_.orientationDeg % 360) + 360) % 360;
     ifd.shorts(274, {static_cast<uint16_t>(deg == 90 ? 6 : deg == 180 ? 3 : deg == 270 ? 8 : 1)});
-    ifd.shorts(277, {1});
-    ifd.longs(278, {fi.height});
-    ifd.longs(279, {fi.width * fi.height * 2});
+    ifd.shorts(277, {static_cast<uint16_t>(spp)});
+    ifd.longs(278, {outH});
+    ifd.longs(279, {outW * outH * 2 * spp});
     ifd.shorts(284, {1});
     ifd.ascii(305, "Cinematic RAW Studio craw2dng");
-    ifd.shorts(33421, {2, 2});
     static const uint8_t pattern[4][4] = {{0, 1, 1, 2}, {1, 0, 2, 1}, {1, 2, 0, 1}, {2, 1, 1, 0}};
-    const int cfa = static_cast<int>(fi.cfa);
-    ifd.bytes(33422, {pattern[cfa][0], pattern[cfa][1], pattern[cfa][2], pattern[cfa][3]});
+    const int cfa = rgb ? 0 : static_cast<int>(fi.cfa);
+    if (!rgb) {
+        ifd.shorts(33421, {2, 2});
+        ifd.bytes(33422, {pattern[cfa][0], pattern[cfa][1], pattern[cfa][2], pattern[cfa][3]});
+    }
     if (fm["exposureTime"].isNumber()) {
         const double ns = fm["exposureTime"].num();
         ifd.rationals(33434, {ns > 1000 ? ns / 1e9 : ns}, false);  // RawLens stores ns
@@ -358,11 +381,20 @@ std::vector<uint8_t> Clip::frameDng(size_t i, uint32_t padTo, unsigned threads) 
     ifd.bytes(50706, {1, 4, 0, 0});
     ifd.bytes(50707, {1, 1, 0, 0});
     ifd.ascii(50708, info_.uniqueModel);
-    ifd.shorts(50713, {2, 2});
     std::vector<double> black(info_.black.begin(), info_.black.end());
     if (auto dyn = numbers(fm["dynamicBlackLevel"]); dyn.size() == 4) black = dyn;
-    ifd.rationals(50714, black, false);
-    ifd.longs(50717, {static_cast<uint32_t>(fm["dynamicWhiteLevel"].num(info_.white))});
+    const auto whiteLevel = static_cast<uint32_t>(fm["dynamicWhiteLevel"].num(info_.white));
+    if (rgb) {
+        // One black/white level per sample (BlackLevelRepeatDim 1x1).
+        const double b = (black[0] + black[1] + black[2] + black[3]) / 4;
+        ifd.shorts(50713, {1, 1});
+        ifd.rationals(50714, {b, b, b}, false);
+        ifd.longs(50717, {whiteLevel, whiteLevel, whiteLevel});
+    } else {
+        ifd.shorts(50713, {2, 2});
+        ifd.rationals(50714, black, false);
+        ifd.longs(50717, {whiteLevel});
+    }
     static const std::vector<double> identity{1, 0, 0, 0, 1, 0, 0, 0, 1};
     ifd.rationals(50721, info_.colorMatrix1.size() == 9 ? info_.colorMatrix1 : identity, true);
     if (info_.colorMatrix2.size() == 9) ifd.rationals(50722, info_.colorMatrix2, true);
@@ -393,7 +425,32 @@ std::vector<uint8_t> Clip::frameDng(size_t i, uint32_t padTo, unsigned threads) 
         }
         if (!ok) { cols = rows = 0; gains.clear(); }
     }
-    if (cols > 0 && rows > 0) {
+    if (cols > 0 && rows > 0 && rgb) {
+        // LinearRaw: one GainMap per colour plane (green = mean of Gr and Gb).
+        std::vector<uint8_t> ops;
+        be<uint32_t>(ops, 3);
+        for (int plane = 0; plane < 3; ++plane) {
+            std::vector<uint8_t> p;
+            be<uint32_t>(p, 0); be<uint32_t>(p, 0);
+            be<uint32_t>(p, outH); be<uint32_t>(p, outW);
+            be<uint32_t>(p, static_cast<uint32_t>(plane)); be<uint32_t>(p, 1);
+            be<uint32_t>(p, 1); be<uint32_t>(p, 1);
+            be<uint32_t>(p, rows); be<uint32_t>(p, cols);
+            beF64(p, 1.0 / rows); beF64(p, 1.0 / cols);
+            beF64(p, 0.5 / rows); beF64(p, 0.5 / cols);
+            be<uint32_t>(p, 1);
+            for (size_t k = 0; k < size_t{cols} * rows; ++k) {
+                const float* g4 = &gains[k * 4];
+                beF32(p, plane == 0 ? g4[0] : plane == 2 ? g4[3] : (g4[1] + g4[2]) / 2);
+            }
+            be<uint32_t>(ops, 9);
+            ops.insert(ops.end(), {1, 3, 0, 0});
+            be<uint32_t>(ops, 0);
+            be<uint32_t>(ops, static_cast<uint32_t>(p.size()));
+            ops.insert(ops.end(), p.begin(), p.end());
+        }
+        ifd.bytes(51009, std::move(ops), UNDEFINED);
+    } else if (cols > 0 && rows > 0) {
         std::vector<uint8_t> ops;
         be<uint32_t>(ops, 4);
         const auto pos = colourPositions(cfa);

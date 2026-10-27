@@ -70,7 +70,10 @@ public:
 
     // Size of every padded DNG of this clip (all frames share dimensions).
     uint64_t paddedDngSize(uint32_t padTo) const;
-    std::pair<uint32_t, uint32_t> frameSize() const { return {width_, height_}; }
+    std::pair<uint32_t, uint32_t> frameSize() const { return {width_, height_}; }  // coded frame size
+    bool isRgb() const { return rgb_; }
+    // Picture size: half the coded size for RGB frames.
+    std::pair<uint32_t, uint32_t> imageSize() const { return rgb_ ? std::make_pair(width_ / 2, height_ / 2) : std::make_pair(width_, height_); }
 
     const AudioInfo& audio() const { return audio_; }
     uint64_t wavSize() const;
@@ -88,6 +91,7 @@ private:
     std::vector<uint8_t> wavHeader_;
     std::map<uint32_t, Shading> shading_;
     uint32_t width_ = 0, height_ = 0;
+    bool rgb_ = false;  // frames carry RGB cells (SPEC 3.8)
 };
 
 // SMPTE timecode string HH:MM:SS:FF for frame `index` at an integer fps.

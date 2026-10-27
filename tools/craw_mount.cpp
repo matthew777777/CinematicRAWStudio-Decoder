@@ -262,9 +262,9 @@ int main(int argc, char** argv) {
             if (c.clip->frameCount() == 0) { std::fprintf(stderr, "skip %s: no frames\n", a.c_str()); continue; }
             // Fixed header room: first frame's header plus 1 MiB for metadata that
             // varies per frame (e.g. a larger lens-shading GainMap).
-            const auto [w, h] = c.clip->frameSize();
+            const auto [w, h] = c.clip->imageSize();
             const auto probe = c.clip->frameDng(0, 0, kThreads);
-            const uint64_t header = probe.size() - uint64_t{w} * h * 2;
+            const uint64_t header = probe.size() - uint64_t{w} * h * (c.clip->isRgb() ? 6 : 2);
             c.pad = static_cast<uint32_t>((header + (1u << 20) + 4095) / 4096 * 4096);
             c.dngSize = c.clip->paddedDngSize(c.pad);
             std::printf("%s: %zu frames %ux%u -> %s/%s/\n", a.c_str(), c.clip->frameCount(), w, h, argv[1],
