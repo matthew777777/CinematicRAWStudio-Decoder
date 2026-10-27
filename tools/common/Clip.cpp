@@ -197,8 +197,10 @@ Clip::Clip(const std::string& path) : reader_(path) {
             if (ch == 0 || bytes != p.size() - 20) continue;
             if (audio_.format == 0) { audio_.format = fmt; audio_.channels = ch; audio_.sampleRate = rate; }
             if (fmt != audio_.format || ch != audio_.channels || rate != audio_.sampleRate) continue;  // keep one stream
-            audioParts_.push_back({wavData, b + 20, bytes});
-            wavData += bytes;
+            // WAV is always integer PCM (NLEs handle float WAV poorly): F32 -> 24-bit.
+            const size_t outBytes = fmt == 2 ? bytes / 4 * 3 : bytes;
+            audioParts_.push_back({wavData, b + 20, outBytes});
+            wavData += outBytes;
             audio_.frames += frames;
         }
     }
@@ -209,14 +211,22 @@ Clip::Clip(const std::string& path) : reader_(path) {
         height_ = fi.height;
     }
     if (audio_.format != 0) {
-        const bool f = audio_.format == 2;
-        const uint16_t bits = audio_.format == 1 ? 16 : audio_.format == 3 ? 24 : 32;
+        const uint16_t bits = audio_.format == 1 ? 16 : 24;
         const uint16_t align = static_cast<uint16_t>(audio_.channels * bits / 8);
         auto& h = wavHeader_;
         auto tag = [&](const char* t) { h.insert(h.end(), t, t + 4); };
-        tag("RIFF"); le<uint32_t>(h, static_cast<uint32_t>(std::min<uint64_t>(36 + wavData, 0xFFFFFFFFu))); tag("WAVE");
-        tag("fmt "); le<uint32_t>(h, 16); le<uint16_t>(h, f ? 3 : 1); le<uint16_t>(h, static_cast<uint16_t>(audio_.channels));
+        // Broadcast WAV: 'bext' with TimeReference 0 so the audio lines up with
+        // the CinemaDNG timecode (00:00:00:00) in an NLE.
+        std::vector<uint8_t> bext(602, 0);
+        const char desc[] = "Cinematic RAW Studio";
+        std::memcpy(bext.data(), desc, sizeof desc - 1);          // Description[256]
+        std::memcpy(bext.data() + 256, desc, sizeof desc - 1);    // Originator[32]
+        bext[346] = 1;                                            // Version (after TimeReference u64 at 338)
+        const uint32_t riff = static_cast<uint32_t>(std::min<uint64_t>(4 + 8 + 16 + 8 + bext.size() + 8 + wavData, 0xFFFFFFFFu));
+        tag("RIFF"); le<uint32_t>(h, riff); tag("WAVE");
+        tag("fmt "); le<uint32_t>(h, 16); le<uint16_t>(h, 1); le<uint16_t>(h, static_cast<uint16_t>(audio_.channels));
         le<uint32_t>(h, audio_.sampleRate); le<uint32_t>(h, audio_.sampleRate * align); le<uint16_t>(h, align); le<uint16_t>(h, bits);
+        tag("bext"); le<uint32_t>(h, static_cast<uint32_t>(bext.size())); h.insert(h.end(), bext.begin(), bext.end());
         tag("data"); le<uint32_t>(h, static_cast<uint32_t>(std::min<uint64_t>(wavData, 0xFFFFFFFFu)));
     }
 }
@@ -246,7 +256,19 @@ size_t Clip::readWav(uint64_t offset, uint8_t* dst, size_t len) const {
         const uint64_t within = dataAt - it->wavOffset;
         if (within >= it->size) break;
         const size_t n = std::min<size_t>(len - done, it->size - within);
-        std::memcpy(dst + done, it->data + within, n);
+        if (audio_.format == 2) {
+            // float32 -> 24-bit PCM, byte by byte so any offset/length works.
+            for (size_t k = 0; k < n; ++k) {
+                const uint64_t o = within + k;
+                float f;
+                std::memcpy(&f, it->data + o / 3 * 4, 4);
+                const double v = std::clamp(static_cast<double>(f), -1.0, 1.0) * 8388607.0;
+                const int32_t q = static_cast<int32_t>(std::lround(v));
+                dst[done + k] = static_cast<uint8_t>(static_cast<uint32_t>(q) >> (8 * (o % 3)));
+            }
+        } else {
+            std::memcpy(dst + done, it->data + within, n);
+        }
         done += n;
     }
     return done;
