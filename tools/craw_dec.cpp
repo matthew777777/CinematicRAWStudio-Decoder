@@ -2,7 +2,7 @@
 //
 // craw_dec info   file.craw
 // craw_dec verify file.craw            decode every frame, check CRCs, JSON timing
-// craw_dec frames file.craw out_dir    write frame_NNNNNN.raw (uint16 LE)
+// craw_dec frames file.craw out_dir [FIRST[-LAST]]   write frame_NNNNNN.raw (uint16 LE)
 #include <craw/Reader.h>
 
 #include <algorithm>
@@ -32,7 +32,14 @@ int main(int argc, char** argv) {
         std::vector<uint16_t> out;
         double totalMs = 0, worstMs = 0, mpix = 0;
         size_t bad = 0;
-        for (size_t i = 0; i < r.frameCount(); ++i) {
+        size_t first = 0, last = r.frameCount() ? r.frameCount() - 1 : 0;
+        if (cmd == "frames" && argc > 4) {
+            const std::string range = argv[4];
+            const auto dash = range.find('-');
+            first = std::stoul(range.substr(0, dash));
+            last = dash == std::string::npos ? first : std::stoul(range.substr(dash + 1));
+        }
+        for (size_t i = first; i < r.frameCount() && i <= last; ++i) {
             try {
                 const auto rec = r.frame(i);
                 const auto t0 = std::chrono::steady_clock::now();
