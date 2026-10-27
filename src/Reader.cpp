@@ -81,7 +81,7 @@ void Reader::scan() {
         c.offset = pos;
         c.size = size;
         const uint8_t* body = d + pos + kChunkHeader;
-        c.crcOk = detail::crc32c(body, size) == rd32(body + size);
+        c.crcOk = detail::crc32c(body, static_cast<size_t>(size)) == rd32(body + size);
         if (std::memcmp(d + pos, "FRAM", 4) == 0 && size >= kFramHeader)
             c.timestampNs = static_cast<int64_t>(rd64(body + 8));
         else if ((std::memcmp(d + pos, "AUDI", 4) == 0 || std::memcmp(d + pos, "LSHD", 4) == 0) && size >= 8)
@@ -99,7 +99,7 @@ void Reader::scan() {
 }
 
 std::string_view Reader::payload(const ChunkRef& c) const {
-    return {reinterpret_cast<const char*>(data_ + c.offset + kChunkHeader), c.size};
+    return {reinterpret_cast<const char*>(data_ + c.offset + kChunkHeader), static_cast<size_t>(c.size)};
 }
 
 FrameRecord Reader::frame(size_t i) const {
@@ -111,7 +111,7 @@ FrameRecord Reader::frame(size_t i) const {
     if (metaLen > c.size - kFramHeader) throw DecodeError("craw: bad FRAM meta length");
     return {rd64(b), static_cast<int64_t>(rd64(b + 8)),
             std::string(reinterpret_cast<const char*>(b + kFramHeader), metaLen),
-            b + kFramHeader + metaLen, c.size - kFramHeader - metaLen};
+            b + kFramHeader + metaLen, static_cast<size_t>(c.size - kFramHeader - metaLen)};
 }
 
 }  // namespace craw
