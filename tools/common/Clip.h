@@ -55,6 +55,10 @@ struct RawFrame {
 class Clip {
 public:
     explicit Clip(const std::string& path);
+#ifndef _WIN32
+    // From an open descriptor (see Reader(int, name)); `fd` stays the caller's.
+    Clip(int fd, const std::string& name);
+#endif
 
     const ClipInfo& info() const { return info_; }
     size_t frameCount() const { return reader_.frameCount(); }
@@ -81,6 +85,7 @@ public:
     size_t readWav(uint64_t offset, uint8_t* dst, size_t len) const;
 
 private:
+    void init();
     struct AudioPart { uint64_t wavOffset; const uint8_t* data; size_t size; };
     struct Shading { uint16_t columns = 0, rows = 0; std::vector<float> gains; };
 

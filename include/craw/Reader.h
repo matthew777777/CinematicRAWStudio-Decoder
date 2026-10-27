@@ -32,6 +32,12 @@ struct FrameRecord {
 class Reader {
 public:
     explicit Reader(const std::string& path);  // throws DecodeError; memory-maps the file
+#ifndef _WIN32
+    // Memory-maps an already open file (e.g. an Android content-provider
+    // descriptor that cannot be reopened by path). `fd` stays owned by the
+    // caller and may be closed after construction. `name` labels errors.
+    Reader(int fd, const std::string& name);
+#endif
     ~Reader();
     Reader(const Reader&) = delete;
     Reader& operator=(const Reader&) = delete;
@@ -47,6 +53,7 @@ public:
 
 private:
     void scan();
+    void scanOrRelease();
     void release();
 
     const uint8_t* data_ = nullptr;

@@ -72,6 +72,39 @@ Reader::Reader(const std::string& path) {
         data_ = owned_.data();
         size_ = owned_.size();
     }
+    scanOrRelease();
+}
+
+#ifndef _WIN32
+Reader::Reader(int fd, const std::string& name) {
+    struct stat st{};
+    if (fd < 0 || ::fstat(fd, &st) != 0) throw DecodeError("craw: cannot open " + name);
+#ifdef CRAW_HAVE_MMAP
+    if (st.st_size > 0) {
+        void* m = ::mmap(nullptr, static_cast<size_t>(st.st_size), PROT_READ, MAP_PRIVATE, fd, 0);
+        if (m != MAP_FAILED) {
+            data_ = static_cast<const uint8_t*>(m);
+            size_ = static_cast<size_t>(st.st_size);
+        }
+    }
+#endif
+    if (!data_) {
+        // No mmap: read the whole file through the descriptor.
+        owned_.resize(static_cast<size_t>(st.st_size));
+        size_t got = 0;
+        while (got < owned_.size()) {
+            const ssize_t n = ::pread(fd, owned_.data() + got, owned_.size() - got, static_cast<off_t>(got));
+            if (n <= 0) throw DecodeError("craw: cannot read " + name);
+            got += static_cast<size_t>(n);
+        }
+        data_ = owned_.data();
+        size_ = owned_.size();
+    }
+    scanOrRelease();
+}
+#endif
+
+void Reader::scanOrRelease() {
     try {
         scan();
     } catch (...) {

@@ -119,7 +119,13 @@ std::string timecode(int64_t index, int fps) {
     return buf;
 }
 
-Clip::Clip(const std::string& path) : reader_(path) {
+Clip::Clip(const std::string& path) : reader_(path) { init(); }
+
+#ifndef _WIN32
+Clip::Clip(int fd, const std::string& name) : reader_(fd, name) { init(); }
+#endif
+
+void Clip::init() {
     const json::Value meta = json::parseOrEmpty(reader_.metaJson());
     const json::Value& sensor = meta["sensor"];
     const json::Value& camera = meta["camera"];
