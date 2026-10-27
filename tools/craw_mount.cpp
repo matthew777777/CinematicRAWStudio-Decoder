@@ -15,6 +15,24 @@
 
 #include <fuse.h>
 
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <ctime>
+
+// libfuse / fuse-t use struct stat and off_t; WinFsp's FUSE layer has its own types.
+#if defined(_WIN32)
+using craw_stat_t = struct fuse_stat;
+using craw_off_t = fuse_off_t;
+#ifndef O_ACCMODE
+#define O_ACCMODE 3
+#endif
+#define CRAW_SET_MTIME(st, t) ((st)->st_mtim.tv_sec = (t))
+#else
+using craw_stat_t = struct stat;
+using craw_off_t = off_t;
+#define CRAW_SET_MTIME(st, t) ((st)->st_mtime = (t))
+#endif
+
 #include <algorithm>
 #include <cerrno>
 #include <cstdio>
@@ -148,34 +166,34 @@ void prefetchAfter(const MountedClip& c, size_t i) {
     }
 }
 
-int doGetattr(const char* path, struct stat* st) {
+int doGetattr(const char* path, craw_stat_t* st) {
     std::memset(st, 0, sizeof *st);
     const Node n = resolve(path);
     switch (n.kind) {
         case Node::Root:
         case Node::Dir:
-            if (n.clip) st->st_mtime = n.clip->mtime;
+            if (n.clip) CRAW_SET_MTIME(st, n.clip->mtime);
             st->st_mode = S_IFDIR | 0555;
             st->st_nlink = 2;
             return 0;
         case Node::Dng:
             st->st_mode = S_IFREG | 0444;
             st->st_nlink = 1;
-            st->st_size = static_cast<off_t>(n.clip->dngSize);
-            st->st_mtime = n.clip->mtime;
+            st->st_size = static_cast<craw_off_t>(n.clip->dngSize);
+            CRAW_SET_MTIME(st, n.clip->mtime);
             return 0;
         case Node::Wav:
             st->st_mode = S_IFREG | 0444;
             st->st_nlink = 1;
-            st->st_size = static_cast<off_t>(n.clip->clip->wavSize());
-            st->st_mtime = n.clip->mtime;
+            st->st_size = static_cast<craw_off_t>(n.clip->clip->wavSize());
+            CRAW_SET_MTIME(st, n.clip->mtime);
             return 0;
         default:
             return -ENOENT;
     }
 }
 
-int doReaddir(const char* path, void* buf, fuse_fill_dir_t fill, off_t, struct fuse_file_info*) {
+int doReaddir(const char* path, void* buf, fuse_fill_dir_t fill, craw_off_t, struct fuse_file_info*) {
     const Node n = resolve(path);
     if (n.kind != Node::Root && n.kind != Node::Dir) return -ENOENT;
     fill(buf, ".", nullptr, 0);
@@ -200,7 +218,7 @@ int doOpen(const char* path, struct fuse_file_info* fi) {
     return 0;
 }
 
-int doRead(const char* path, char* out, size_t size, off_t offset, struct fuse_file_info*) {
+int doRead(const char* path, char* out, size_t size, craw_off_t offset, struct fuse_file_info*) {
     const Node n = resolve(path);
     if (offset < 0) return -EINVAL;
     if (n.kind == Node::Wav) {
