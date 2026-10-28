@@ -96,3 +96,23 @@ by the virtual mount.
 
 In Resolve, place the video and WAV at the same timeline start. See the
 [sibling getting-started guide](../CinematicRAWStudio-Spec/GETTING_STARTED.md).
+
+## Desktop Compact (codec 4)
+
+With the sibling Encoder checkout present, the tools build also produces
+`craw_compact in.craw out.craw`; the desktop wrapper exposes this as
+`craw compact in.craw out.craw`. Set `-DCRAW_BUILD_COMPACT=ON` and, if needed,
+`-DCRAW_ENCODER_DIR=/path/to/CinematicRAWStudio-Encoder` to require it.
+Decoder-only and Android builds can use `-DCRAW_BUILD_COMPACT=OFF`; codec 4
+decoding itself has no Encoder dependency.
+
+Compaction decodes, re-encodes and checks every frame bit for bit. It keeps an
+original payload if Compact is not smaller, copies frame records and ancillary
+chunks exactly, and rebuilds the seek index. Output publication refuses existing
+paths. It requires a complete indexed input, creates a temporary file beside the
+output, and removes that file after errors. Publication uses a hard link, so the
+output filesystem must support hard links. Repair incomplete recordings first.
+
+Codec 4 and mixed-codec takes work through the shared decoder in `craw_dec`,
+`craw2dng`, `craw_mount`, FSKit and the TUI. Compact decode is slower than Live v2;
+see the sibling Spec's `results/codec4-20261028/REPORT.md` for measured costs.
