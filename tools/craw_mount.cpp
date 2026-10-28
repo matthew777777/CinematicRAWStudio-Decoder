@@ -7,7 +7,7 @@
 //
 // Read-only virtual filesystem that presents every .CRAW take as a CinemaDNG
 // folder, so DaVinci Resolve (or any CinemaDNG reader) opens it directly:
-//   MOUNTPOINT/<name>/<name>_000000.dng ... <name>.wav
+//   MOUNTPOINT/<name>/<name>_000000.dng ... <name>.wav <name>.gcsv (Gyroflow)
 // DNGs are decoded on demand (lossless). All frames of a clip have the same
 // file size: pixel data starts at a fixed padded offset, so directory
 // listings need no decoding. Unmount with `umount MOUNTPOINT`.
@@ -61,6 +61,7 @@ struct MountedClip {
     std::unique_ptr<craw::tools::Clip> clip;
     uint32_t pad = 0;
     uint64_t dngSize = 0;
+    std::string gcsv;  // Gyroflow motion log; empty = no gyro
     // Last frame read, for playback prefetch (heap-held: atomics don't move).
     struct Playback { std::atomic<long> lastFrame{-2}; };
     std::unique_ptr<Playback> play = std::make_unique<Playback>();
@@ -74,6 +75,7 @@ struct CachedFrame {
 
 std::vector<MountedClip> gClips;
 bool gFlat = false;
+std::string gGcsvOrientation = craw::tools::Clip::kDefaultGcsvOrientation;
 std::mutex gCacheMutex;
 std::list<CachedFrame> gCache;  // most recent first
 // Cache by memory, not frame count: scrubbing revisits frames, and a
@@ -105,7 +107,7 @@ std::deque<std::pair<const MountedClip*, size_t>> gQueue;
 
 struct Node {
     const MountedClip* clip = nullptr;
-    enum { None, Root, Dir, Dng, Wav } kind = None;
+    enum { None, Root, Dir, Dng, Wav, Gcsv } kind = None;
     size_t frame = 0;
 };
 
@@ -127,6 +129,7 @@ Node resolve(const char* path) {
         if (slash == std::string::npos) { n.kind = Node::Dir; return n; }
         const std::string file = p.substr(slash + 1);
         if (file == c.name + ".wav" && c.clip->audio().format != 0) { n.kind = Node::Wav; return n; }
+        if (file == c.name + ".gcsv" && !c.gcsv.empty()) { n.kind = Node::Gcsv; return n; }
         const std::string prefix = c.name + "_";
         if (file.size() == prefix.size() + 10 && file.compare(0, prefix.size(), prefix) == 0 &&
             file.compare(file.size() - 4, 4, ".dng") == 0) {
@@ -255,6 +258,12 @@ int doGetattr(const char* path, craw_stat_t* st
             st->st_size = static_cast<craw_off_t>(n.clip->clip->wavSize());
             CRAW_SET_MTIME(st, n.clip->mtime);
             return 0;
+        case Node::Gcsv:
+            st->st_mode = S_IFREG | 0444;
+            st->st_nlink = 1;
+            st->st_size = static_cast<craw_off_t>(n.clip->gcsv.size());
+            CRAW_SET_MTIME(st, n.clip->mtime);
+            return 0;
         default:
             return -ENOENT;
     }
@@ -286,12 +295,13 @@ int doReaddir(const char* path, void* buf, fuse_fill_dir_t filler, craw_off_t, s
         fill(buf, file, nullptr, 0);
     }
     if (n.clip->clip->audio().format != 0) fill(buf, (n.clip->name + ".wav").c_str(), nullptr, 0);
+    if (!n.clip->gcsv.empty()) fill(buf, (n.clip->name + ".gcsv").c_str(), nullptr, 0);
     return 0;
 }
 
 int doOpen(const char* path, struct fuse_file_info* fi) {
     const Node n = resolve(path);
-    if (n.kind != Node::Dng && n.kind != Node::Wav) return -ENOENT;
+    if (n.kind != Node::Dng && n.kind != Node::Wav && n.kind != Node::Gcsv) return -ENOENT;
     if ((fi->flags & O_ACCMODE) != O_RDONLY) return -EACCES;
     return 0;
 }
@@ -304,6 +314,13 @@ int doRead(const char* path, char* out, size_t size, craw_off_t offset, struct f
         if (static_cast<uint64_t>(offset) >= total) return 0;
         const size_t len = static_cast<size_t>(std::min<uint64_t>(size, total - offset));
         return static_cast<int>(n.clip->clip->readWav(offset, reinterpret_cast<uint8_t*>(out), len));
+    }
+    if (n.kind == Node::Gcsv) {
+        const std::string& g = n.clip->gcsv;
+        if (static_cast<uint64_t>(offset) >= g.size()) return 0;
+        const size_t len = std::min(size, g.size() - static_cast<size_t>(offset));
+        std::memcpy(out, g.data() + offset, len);
+        return static_cast<int>(len);
     }
     if (n.kind != Node::Dng) return -ENOENT;
     try {
@@ -323,7 +340,7 @@ int doRead(const char* path, char* out, size_t size, craw_off_t offset, struct f
 
 int main(int argc, char** argv) {
     if (argc < 3) {
-        std::fprintf(stderr, "usage: craw_mount MOUNTPOINT clip.craw [clip.craw ...] [--cache-mb 2048] [-f] [fuse options]\n");
+        std::fprintf(stderr, "usage: craw_mount MOUNTPOINT clip.craw [clip.craw ...] [--cache-mb 2048] [--gcsv-orientation XYZ] [-f] [fuse options]\n");
         return 2;
     }
     std::vector<char*> fuseArgs{argv[0], argv[1]};
@@ -331,6 +348,7 @@ int main(int argc, char** argv) {
         const std::string a = argv[i];
         if (a == "--flat") { gFlat = true; continue; }
         if (a == "--cache-mb" && i + 1 < argc) { gCacheBytes = std::stoull(argv[++i]) << 20; continue; }
+        if (a == "--gcsv-orientation" && i + 1 < argc) { gGcsvOrientation = argv[++i]; continue; }
         if (!a.empty() && a[0] == '-') { fuseArgs.push_back(argv[i]); continue; }
         try {
             MountedClip c;
@@ -347,6 +365,7 @@ int main(int argc, char** argv) {
             const uint64_t header = probe.size() - c.clip->dngPixelBytes();
             c.pad = static_cast<uint32_t>((header + (1u << 20) + 4095) / 4096 * 4096);
             c.dngSize = c.clip->paddedDngSize(c.pad);
+            c.gcsv = c.clip->gcsv(gGcsvOrientation);
             std::printf("%s: %zu frames %ux%u -> %s/%s/\n", a.c_str(), c.clip->frameCount(), w, h, argv[1],
                         c.name.c_str());
             gClips.push_back(std::move(c));

@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // craw2dng in.craw out_dir [--frames FIRST-LAST] [--no-audio] [--threads N]
+//          [--gcsv-orientation XYZ]
 //
 // Writes a CinemaDNG sequence DaVinci Resolve imports as a clip:
 //   out_dir/<name>/<name>_000000.dng ... and out_dir/<name>/<name>.wav
+// plus <name>.gcsv (Gyroflow motion log) when the take has gyro data.
 // Lossless: DNG pixels are the decoded CFA samples, metadata from META and
 // each frame's JSON (lens shading becomes a DNG GainMap opcode).
 #include "common/Clip.h"
@@ -20,12 +22,13 @@ namespace fs = std::filesystem;
 
 int main(int argc, char** argv) {
     if (argc < 3) {
-        std::fprintf(stderr, "usage: craw2dng in.craw out_dir [--frames FIRST-LAST] [--no-audio] [--threads N]\n");
+        std::fprintf(stderr, "usage: craw2dng in.craw out_dir [--frames FIRST-LAST] [--no-audio] [--threads N] [--gcsv-orientation XYZ]\n");
         return 2;
     }
     const fs::path in = argv[1];
     size_t first = 0, last = SIZE_MAX;
     bool audio = true;
+    std::string gcsvOrientation = craw::tools::Clip::kDefaultGcsvOrientation;
     unsigned threads = std::max(1u, std::thread::hardware_concurrency());
     for (int i = 3; i < argc; ++i) {
         const std::string a = argv[i];
@@ -36,6 +39,7 @@ int main(int argc, char** argv) {
             first = std::stoul(r.substr(0, dash));
             last = dash == std::string::npos ? first : std::stoul(r.substr(dash + 1));
         } else if (a == "--threads" && i + 1 < argc) threads = std::stoul(argv[++i]);
+        else if (a == "--gcsv-orientation" && i + 1 < argc) gcsvOrientation = argv[++i];
         else { std::fprintf(stderr, "unknown option %s\n", a.c_str()); return 2; }
     }
     try {
@@ -71,10 +75,17 @@ int main(int argc, char** argv) {
             if (!f || std::fwrite(wav.data(), 1, wav.size(), f) != wav.size()) return 1;
             std::fclose(f);
         }
+        // Gyroflow motion log next to the sequence (<name>.gcsv, Gyroflow 1.7+).
+        const std::string gcsv = clip.gcsv(gcsvOrientation);
+        if (!gcsv.empty()) {
+            std::FILE* f = std::fopen((dir / (name + ".gcsv")).string().c_str(), "wb");
+            if (!f || std::fwrite(gcsv.data(), 1, gcsv.size(), f) != gcsv.size()) return 1;
+            std::fclose(f);
+        }
         const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-        std::printf("{\"tool\":\"craw2dng\",\"out\":\"%s\",\"frames\":%zu,\"failed\":%zu,\"audio\":%s,\"seconds\":%.2f}\n",
+        std::printf("{\"tool\":\"craw2dng\",\"out\":\"%s\",\"frames\":%zu,\"failed\":%zu,\"audio\":%s,\"gyro\":%s,\"seconds\":%.2f}\n",
                     dir.string().c_str(), written, failed,
-                    audio && clip.audio().format ? "true" : "false", s);
+                    audio && clip.audio().format ? "true" : "false", gcsv.empty() ? "false" : "true", s);
         return failed ? 1 : 0;
     } catch (const std::exception& e) {
         std::fprintf(stderr, "craw2dng: %s\n", e.what());

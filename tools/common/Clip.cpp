@@ -344,6 +344,61 @@ uint64_t Clip::dngPixelBytes() const {
     return (w * spp * packBits_ + 7) / 8 * h;
 }
 
+std::string Clip::gcsv(const std::string& orientation) const {
+    struct Sample { int64_t t; float v[3]; };
+    std::vector<Sample> gyro, accel;
+    for (const auto& c : reader_.chunks()) {
+        if (std::memcmp(c.fourcc.data(), "IMU_", 4) != 0 || !reader_.crcOk(c)) continue;
+        const auto p = reader_.payload(c);
+        if (p.size() < 8) continue;
+        const auto* d = reinterpret_cast<const uint8_t*>(p.data());
+        uint32_t count;
+        std::memcpy(&count, d + 4, 4);
+        if (p.size() < 8 + size_t{count} * 20) continue;
+        auto& dst = d[0] == 1 ? gyro : d[0] == 2 ? accel : gyro;
+        if (d[0] != 1 && d[0] != 2) continue;
+        for (uint32_t i = 0; i < count; ++i) {
+            Sample s;
+            std::memcpy(&s.t, d + 8 + 20 * size_t{i}, 8);
+            std::memcpy(s.v, d + 16 + 20 * size_t{i}, 12);
+            dst.push_back(s);
+        }
+    }
+    if (gyro.empty()) return {};
+    auto byTime = [](const Sample& a, const Sample& b) { return a.t < b.t; };
+    std::stable_sort(gyro.begin(), gyro.end(), byTime);
+    std::stable_sort(accel.begin(), accel.end(), byTime);
+    const int64_t t0 = reader_.frameCount() ? reader_.frame(0).timestampNs : gyro.front().t;
+
+    std::string out = "GYROFLOW IMU LOG\nversion,1.3\n";
+    out += "id,craw_" + info_.uniqueModel + "\n";
+    out += "orientation," + orientation + "\n";
+    out += "note,Cinematic RAW Studio: raw Android sensor axes; t = 0 at the first frame\n";
+    out += "vendor," + info_.make + "\n";
+    out += "tscale,0.000001\ngscale,1\nascale,1\n";
+    out += accel.empty() ? "t,gx,gy,gz\n" : "t,gx,gy,gz,ax,ay,az\n";
+    constexpr double kG = 9.80665;  // m/s^2 -> g
+    size_t a = 0;
+    char line[160];
+    for (const auto& g : gyro) {
+        if (g.t < t0) continue;  // before the first frame
+        const long long us = static_cast<long long>((g.t - t0) / 1000);
+        if (accel.empty()) {
+            std::snprintf(line, sizeof line, "%lld,%.6f,%.6f,%.6f\n", us, g.v[0], g.v[1], g.v[2]);
+        } else {
+            while (a + 1 < accel.size() && accel[a + 1].t <= g.t) ++a;
+            const Sample& p0 = accel[a];
+            const Sample& p1 = a + 1 < accel.size() ? accel[a + 1] : accel[a];
+            const double w = (p1.t > p0.t && g.t > p0.t) ? std::min(1.0, double(g.t - p0.t) / double(p1.t - p0.t)) : 0.0;
+            double v[3];
+            for (int k = 0; k < 3; ++k) v[k] = (p0.v[k] + (p1.v[k] - p0.v[k]) * w) / kG;
+            std::snprintf(line, sizeof line, "%lld,%.6f,%.6f,%.6f,%.5f,%.5f,%.5f\n", us, g.v[0], g.v[1], g.v[2], v[0], v[1], v[2]);
+        }
+        out += line;
+    }
+    return out;
+}
+
 uint64_t Clip::paddedDngSize(uint32_t padTo) const { return uint64_t{padTo} + dngPixelBytes(); }
 
 std::vector<uint8_t> Clip::frameDng(size_t i, uint32_t padTo, unsigned threads) const {

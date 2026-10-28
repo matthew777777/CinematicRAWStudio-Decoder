@@ -86,6 +86,14 @@ public:
     std::pair<uint32_t, uint32_t> imageSize() const { return rgb_ ? std::make_pair(width_ / 2, height_ / 2) : std::make_pair(width_, height_); }
 
     const AudioInfo& audio() const { return audio_; }
+
+    // Gyroflow motion log (.gcsv 1.3) from the IMU_ chunks: one row per gyro
+    // sample, t in microseconds since the first frame, gyro in rad/s and
+    // accelerometer (interpolated to the gyro times) in g, raw Android sensor
+    // axes. `orientation` is Gyroflow's IMU orientation string. Empty when the
+    // take has no gyro data.
+    std::string gcsv(const std::string& orientation = kDefaultGcsvOrientation) const;
+    static constexpr const char* kDefaultGcsvOrientation = "XYZ";
     uint64_t wavSize() const;
     // Reads `len` bytes of the WAV file at `offset` (header + concatenated AUDI samples).
     size_t readWav(uint64_t offset, uint8_t* dst, size_t len) const;
