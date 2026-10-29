@@ -1,7 +1,7 @@
 # crawfs — FSKit module (macOS 26+)
 
-Mounts a `.CRAW` take as a CinemaDNG folder without FUSE (same approach as
-mcrawfs: FSKit unary file system on an `FSPathURLResource`):
+Mounts a `.CRAW` take as a CinemaDNG folder without FUSE (an FSKit unary
+file system on an `FSPathURLResource`):
 
 ```
 mount -F -t crawfs ~/Movies/IMG_..._VID.craw ~/CRAW/take
