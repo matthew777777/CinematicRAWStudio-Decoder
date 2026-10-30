@@ -85,6 +85,15 @@ mount.
 
 ## Recording codec and audio compatibility
 
+Implemented IDs are 1 Fast, 2 Live v1, 3 Live v2 and 4 Compact. Existing IDs
+are not reassigned to future codecs. “Fast” is historical naming; Compact is
+an offline mode, and neither name establishes a speed or compression ranking.
+See the [shared evidence and benchmark guide](https://github.com/matthew777777/CinematicRAWStudio-Spec/blob/main/BENCHMARKS.md)
+and [2026-10-30 comparison](https://github.com/matthew777777/CinematicRAWStudio-Spec/tree/main/results/comparison-20261030)
+for identical-RAW CRAW/JPEG XL payload sizes, encode/decode CPU and wall time,
+memory and sustained isolated device loops. Those tests do not establish
+actual Resolve import, mount performance or sustained capture.
+
 Both CRAW-Live (codec 2) and CRAW-Fast (codec 1) decode to the original RAW
 samples. Payloads without a frame CRC rely on the container chunk CRC32C.
 WAV exports use integer PCM, retaining 16/24-bit source precision and

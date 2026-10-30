@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// Decoder for .CRAW frame payloads: codec 1 ("CRAW-Fast") and codec 2
-// ("CRAW-Live") (SPEC.md section 3).
+// Decoder for .CRAW frame payloads: 1 Fast, 2 Live v1, 3 Live v2,
+// 4 Compact (SPEC.md section 3).
 // Treats input as untrusted: every length and offset is bounds-checked.
 #pragma once
 
