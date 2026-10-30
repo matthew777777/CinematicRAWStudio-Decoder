@@ -85,7 +85,7 @@ mount.
 
 ## Recording codec and audio compatibility
 
-Implemented IDs are 1 Fast, 2 Live v1, 3 Live v2 and 4 Compact. Existing IDs
+Display names for IDs 1–4 are Balanced, Live v1 — Legacy, Live and Compact — Offline. Existing IDs
 are not reassigned to future codecs. “Fast” is historical naming; Compact is
 an offline mode, and neither name establishes a speed or compression ranking.
 See the [shared evidence and benchmark guide](https://github.com/matthew777777/CinematicRAWStudio-Spec/blob/main/BENCHMARKS.md)
@@ -106,7 +106,7 @@ by the virtual mount.
 In Resolve, place the video and WAV at the same timeline start. See the
 [sibling getting-started guide](../CinematicRAWStudio-Spec/GETTING_STARTED.md).
 
-## Desktop Compact (codec 4)
+## CRAW Compact — Offline (codec 4)
 
 With the sibling Encoder checkout present, the tools build also produces
 `craw_compact in.craw out.craw`; the desktop wrapper exposes this as
@@ -125,3 +125,20 @@ output filesystem must support hard links. Repair incomplete recordings first.
 Codec 4 and mixed-codec takes work through the shared decoder in `craw_dec`,
 `craw2dng`, `craw_mount`, FSKit and the TUI. Compact decode is slower than Live v2;
 see the sibling Spec's `results/codec4-20261028/REPORT.md` for measured costs.
+
+
+## Codec display names
+
+| ID | Display name | Historical names / aliases |
+|---:|---|---|
+| 1 | **CRAW Balanced** | CRAW-Fast, Fast |
+| 2 | **CRAW Live v1 — Legacy** | CRAW-Live, CRAW-Live v1, Live v1 |
+| 3 | **CRAW Live** | CRAW-Live v2, Live v2 |
+| 4 | **CRAW Compact — Offline** | CRAW-Compact, Desktop Compact |
+
+These are display names. Codec IDs, encoded bytes, saved numeric preferences
+and legacy metadata strings retain their existing meanings. Existing recordings
+are not rewritten. Historical benchmark reports keep their original labels;
+use the IDs to match them to this table. Balanced describes the intended
+size/CPU tradeoff, not a guarantee of the smallest files. Live is the current
+recording choice; Live v1 is retained for compatibility and Compact is offline.

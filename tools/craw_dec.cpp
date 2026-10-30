@@ -23,6 +23,11 @@ int main(int argc, char** argv) {
         if (cmd == "info") {
             std::printf("meta: %s\nframes: %zu%s\n", r.metaJson().c_str(), r.frameCount(),
                         r.recovered() ? " (recovered: no index)" : "");
+            if (r.frameCount()) {
+                const auto frame = r.frame(0);
+                const auto info = craw::probeFrame(frame.payload, frame.payloadSize);
+                std::printf("codec (first frame): %s (id %u)\n", craw::codecDisplayName(info.codec), info.codec);
+            }
             for (auto& c : r.chunks())
                 std::printf("  %.4s @%llu size=%llu ts=%lld%s\n", c.fourcc.data(),
                             (unsigned long long)c.offset, (unsigned long long)c.size,
