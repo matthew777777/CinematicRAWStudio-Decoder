@@ -142,3 +142,13 @@ are not rewritten. Historical benchmark reports keep their original labels;
 use the IDs to match them to this table. Balanced describes the intended
 size/CPU tradeoff, not a guarantee of the smallest files. Live is the current
 recording choice; Live v1 is retained for compatibility and Compact is offline.
+
+
+### DCG/DSG RAW14
+
+The payload header controls sample decoding; a static `whiteLevel: 1023` must
+not turn a 14-bit payload into 10-bit pixels. Packed CinemaDNG output keeps at
+least the encoded frame depth even when calibration metadata is lower. Valid
+per-frame dynamic black/white levels continue to override container defaults for
+development and DNG tags. No rescaling is needed to decode composed DCG samples.
+Shared `dcg14_gbrg_codec*` fixtures verify exact 14-bit decoding across all codecs.

@@ -99,6 +99,7 @@ public:
     size_t readWav(uint64_t offset, uint8_t* dst, size_t len) const;
 
 private:
+    unsigned codedBitDepth_ = 16;
     void init();
     struct AudioPart { uint64_t wavOffset; const uint8_t* data; size_t size; };
     struct Shading { uint16_t columns = 0, rows = 0; std::vector<float> gains; };

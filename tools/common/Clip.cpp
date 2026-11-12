@@ -217,6 +217,7 @@ void Clip::init() {
     if (reader_.frameCount() > 0) {
         const auto rec = reader_.frame(0);
         const auto fi = probeFrame(rec.payload, rec.payloadSize);
+        codedBitDepth_ = fi.bitDepth;
         width_ = fi.width;
         height_ = fi.height;
         rgb_ = fi.cfa == Cfa::RGB;
@@ -335,7 +336,9 @@ RawFrame Clip::frameRaw(size_t i, unsigned threads) const {
 void Clip::setPackedDng(bool on) {
     unsigned bits = 1;
     while (bits < 16 && (1u << bits) <= info_.white) ++bits;
-    packBits_ = on ? bits : 16;
+    // White is calibration, not a bound on stored codes. Static Camera2
+    // metadata can still describe RAW10 while this take stores DCG RAW14.
+    packBits_ = on ? std::max(bits, codedBitDepth_) : 16;
 }
 
 uint64_t Clip::dngPixelBytes() const {
